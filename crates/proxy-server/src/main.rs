@@ -118,10 +118,14 @@ async fn proxy_relative(
     let method = request.method().clone();
     let uri = request.uri().clone();
     let headers = request.headers().clone();
-    let upstream_context = upstream_from_context(&headers)
-        .ok_or_else(|| ProxyError::BadRequest("missing proxy context (referer/cookie)".to_string()))?;
-    let upstream = absolutize_relative_target(&upstream_context, &uri)
-        .map_err(|e| ProxyError::BadRequest(format!("invalid relative proxy target: {e}")))?;
+    let upstream = if let Some(decoded) = upstream_from_bare_token(&uri) {
+        decoded
+    } else {
+        let upstream_context = upstream_from_context(&headers)
+            .ok_or_else(|| ProxyError::BadRequest("missing proxy context (referer/cookie)".to_string()))?;
+        absolutize_relative_target(&upstream_context, &uri)
+            .map_err(|e| ProxyError::BadRequest(format!("invalid relative proxy target: {e}")))?
+    };
     let body_bytes = axum::body::to_bytes(request.into_body(), 16 * 1024 * 1024)
         .await
         .map_err(|e| ProxyError::Upstream(format!("failed reading request body: {e}")))?;
@@ -174,7 +178,9 @@ async fn dispatch_upstream(
         .unwrap_or("")
         .to_string();
     if content_type.contains("text/html") {
-        apply_proxy_context_headers(&mut response_headers, &upstream);
+        if should_apply_proxy_context(status, &headers) {
+            apply_proxy_context_headers(&mut response_headers, &upstream);
+        }
     }
 
     let body = upstream_res
@@ -237,6 +243,14 @@ fn upstream_from_context(headers: &HeaderMap) -> Option<Url> {
 fn upstream_from_header(headers: &HeaderMap) -> Option<Url> {
     let value = headers.get("x-webrascal-upstream")?.to_str().ok()?;
     Url::parse(value).ok()
+}
+
+fn upstream_from_bare_token(uri: &axum::http::Uri) -> Option<Url> {
+    let path = uri.path().trim_start_matches('/');
+    if path.is_empty() || path.contains('/') {
+        return None;
+    }
+    decode_target(path).ok()
 }
 
 fn absolutize_relative_target(upstream_context: &Url, uri: &axum::http::Uri) -> Result<Url, url::ParseError> {
@@ -469,6 +483,28 @@ fn apply_proxy_context_headers(headers: &mut HeaderMap, upstream: &Url) {
             HeaderValue::from_static("strict-origin-when-cross-origin"),
         );
     }
+}
+
+fn should_apply_proxy_context(status: StatusCode, request_headers: &HeaderMap) -> bool {
+    if !status.is_success() {
+        return false;
+    }
+
+    if let Some(dest) = request_headers
+        .get("sec-fetch-dest")
+        .and_then(|value| value.to_str().ok())
+    {
+        return matches!(
+            dest.to_ascii_lowercase().as_str(),
+            "document" | "iframe" | "frame"
+        );
+    }
+
+    request_headers
+        .get(header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .map(|accept| accept.contains("text/html"))
+        .unwrap_or(false)
 }
 
 fn is_hop_by_hop(name: &HeaderName) -> bool {
