@@ -157,6 +157,22 @@ fn runtime_shim_script(upstream: &Url, proxy_origin: &Url) -> String {
       return null;
     }}
   }};
+  const toAppPath = (input) => {{
+    try {{
+      const raw = typeof input === "string" ? input : (input && input.url) ? input.url : "";
+      if (!raw || skip.test(raw)) return null;
+      const resolved = new URL(raw, upstreamBase);
+      if (resolved.origin !== upstreamBase.origin) return null;
+      return resolved.pathname + resolved.search + resolved.hash;
+    }} catch (_) {{
+      return null;
+    }}
+  }};
+  const toNavigable = (input) => {{
+    const appPath = toAppPath(input);
+    if (appPath) return appPath;
+    return toProxy(input);
+  }};
   const toProxyPath = (input) => {{
     const proxied = toProxy(input);
     if (!proxied) return null;
@@ -217,21 +233,21 @@ fn runtime_shim_script(upstream: &Url, proxy_origin: &Url) -> String {
   const origWindowOpen = window.open;
   if (typeof origWindowOpen === "function") {{
     window.open = function(url) {{
-      const proxied = toProxy(url);
-      return origWindowOpen.call(this, proxied || url, ...Array.prototype.slice.call(arguments, 1));
+      const nextUrl = toNavigable(url);
+      return origWindowOpen.call(this, nextUrl || url, ...Array.prototype.slice.call(arguments, 1));
     }};
   }}
   if (window.history && typeof window.history.pushState === "function") {{
     const origPushState = window.history.pushState;
     window.history.pushState = function(state, title, url) {{
-      const nextUrl = url == null ? url : (toProxyPath(String(url)) || url);
+      const nextUrl = url == null ? url : (toAppPath(String(url)) || url);
       return origPushState.call(this, state, title, nextUrl);
     }};
   }}
   if (window.history && typeof window.history.replaceState === "function") {{
     const origReplaceState = window.history.replaceState;
     window.history.replaceState = function(state, title, url) {{
-      const nextUrl = url == null ? url : (toProxyPath(String(url)) || url);
+      const nextUrl = url == null ? url : (toAppPath(String(url)) || url);
       return origReplaceState.call(this, state, title, nextUrl);
     }};
   }}
@@ -240,15 +256,15 @@ fn runtime_shim_script(upstream: &Url, proxy_origin: &Url) -> String {
     if (locProto && typeof locProto.assign === "function") {{
       const origAssign = locProto.assign;
       locProto.assign = function(url) {{
-        const proxied = toProxy(url);
-        return origAssign.call(this, proxied || url);
+        const nextUrl = toNavigable(url);
+        return origAssign.call(this, nextUrl || url);
       }};
     }}
     if (locProto && typeof locProto.replace === "function") {{
       const origReplace = locProto.replace;
       locProto.replace = function(url) {{
-        const proxied = toProxy(url);
-        return origReplace.call(this, proxied || url);
+        const nextUrl = toNavigable(url);
+        return origReplace.call(this, nextUrl || url);
       }};
     }}
   }} catch (_) {{}}
