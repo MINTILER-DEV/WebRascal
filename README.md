@@ -1,51 +1,38 @@
 # WebRascal
 
-Scramjet-inspired web proxy outline in Rust with a WASM runtime for browser integration.
+Rust + WASM outline for a Scramjet-inspired web proxy.
 
-## Workspace Layout
+## Layout
 
-```
+```text
 .
-|- crates/
-|  |- proxy-core/      # shared URL encoding, mount path normalization
-|  |- proxy-rewriter/  # HTML link rewriting into proxy routes
-|  |- proxy-server/    # Axum server, upstream fetch, static shell serving
-|  `- proxy-wasm/      # wasm-bindgen interface for browser-side URL building/SW registration
-|- web/
-|  |- index.html       # basic browser shell
-|  |- bootstrap.js     # initializes wasm and launches proxied iframe
-|  `- sw.js            # service worker outline hooks
-`- Cargo.toml          # workspace manifest
++- crates/
+|  +- proxy-rewriter/   # URL tokenization + HTML/link rewrite
+|  +- proxy-wasm/       # wasm-bindgen wrapper around rewriter core
+|  +- proxy-server/     # Axum proxy server and static web host
++- web/
+   +- index.html        # Proxy UI layout
+   +- app.js            # Browser bootstrap + wasm usage
+   +- sw.js             # Service worker interception skeleton
 ```
 
-## Architecture Outline
+## Quick start
 
-1. Browser shell loads `proxy-wasm` and builds a proxied URL path (`/proxy/{base64url}`).
-2. Browser navigates to proxied route.
-3. `proxy-server` decodes URL payload, fetches upstream response, and returns it.
-4. `proxy-rewriter` rewrites HTML `href/src/action` attributes so in-page navigation stays inside the proxy.
-5. Service worker is scaffolded for future request virtualization/caching logic.
+1. Build and run the server:
 
-## Run Locally
+```bash
+cargo run -p proxy-server
+```
 
-1. Build wasm bindings:
-   ```powershell
-   wasm-pack build crates/proxy-wasm --target web --out-dir pkg --out-name proxy_wasm
-   ```
-2. Start proxy server:
-   ```powershell
-   cargo run -p proxy-server
-   ```
-3. Open:
-   `http://127.0.0.1:3000`
+2. Optional: build WASM helpers into `web/pkg`:
 
-## Environment Variables
+```bash
+wasm-pack build crates/proxy-wasm --target web --out-dir ../../web/pkg
+```
 
-- `PROXY_BIND` (default: `127.0.0.1:3000`)
-- `PROXY_MOUNT` (default: `/proxy/`)
+3. Open `http://127.0.0.1:8080`.
 
 ## Notes
 
-- This is intentionally a scaffold, not a hardened production proxy.
-- Add production controls before use: auth, target allowlists, CSP/header strategy, request limits, abuse protections, and robust JS/CSS rewriting.
-
+- This is an architecture scaffold, not a production-safe proxy.
+- Missing pieces for production: CSP/sandbox hardening, cookie/session isolation, websocket piping, full JS/CSS rewriting, and abuse controls.

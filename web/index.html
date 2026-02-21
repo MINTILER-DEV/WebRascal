@@ -3,92 +3,144 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>WebRascal Proxy Outline</title>
+  <title>WebRascal Proxy</title>
   <style>
     :root {
-      --bg: #f3f4ef;
-      --panel: #fffdf7;
-      --ink: #222222;
-      --muted: #5d5d5d;
-      --accent: #1f7a63;
-      --border: #d9d3c3;
+      --bg: #f7f4eb;
+      --panel: #ffffff;
+      --text: #1e1e1e;
+      --muted: #6a6a6a;
+      --accent: #d96f32;
+      --accent-dark: #9b4312;
+      --line: #dad1c5;
+      --shadow: 0 12px 40px rgba(13, 14, 17, 0.1);
+      font-family: "Space Grotesk", "Segoe UI", sans-serif;
     }
-    * { box-sizing: border-box; }
+
+    * {
+      box-sizing: border-box;
+    }
+
     body {
       margin: 0;
-      font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
-      color: var(--ink);
-      background: radial-gradient(circle at 15% 20%, #f9ebc8 0%, transparent 35%),
-                  radial-gradient(circle at 80% 25%, #d9f2e6 0%, transparent 30%),
-                  var(--bg);
       min-height: 100vh;
+      color: var(--text);
+      background:
+        radial-gradient(circle at 15% 20%, #ffe4cb 0%, transparent 35%),
+        radial-gradient(circle at 85% 80%, #c6e9e9 0%, transparent 38%),
+        var(--bg);
       display: grid;
-      place-items: center;
-      padding: 1.5rem;
+      grid-template-rows: auto 1fr;
+      gap: 12px;
+      padding: 16px;
     }
-    .frame {
-      width: min(960px, 100%);
-      border: 1px solid var(--border);
+
+    .panel {
       background: var(--panel);
-      border-radius: 14px;
-      box-shadow: 0 20px 40px rgba(0, 0, 0, 0.08);
-      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      box-shadow: var(--shadow);
     }
+
     .toolbar {
-      display: flex;
-      gap: 0.5rem;
-      padding: 0.9rem;
-      border-bottom: 1px solid var(--border);
-      background: linear-gradient(90deg, #ffead8, #f6f6e3);
+      padding: 14px;
+      display: grid;
+      gap: 10px;
     }
-    input {
-      flex: 1;
-      border: 1px solid var(--border);
+
+    .headline {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 8px;
+    }
+
+    .headline h1 {
+      margin: 0;
+      font-size: 1.1rem;
+      letter-spacing: 0.02em;
+    }
+
+    .headline small {
+      color: var(--muted);
+      font-size: 0.8rem;
+    }
+
+    form {
+      display: grid;
+      grid-template-columns: 1fr auto auto;
+      gap: 8px;
+    }
+
+    input[type="url"] {
+      border: 1px solid var(--line);
       border-radius: 10px;
-      padding: 0.75rem 0.85rem;
+      padding: 10px 12px;
       font-size: 0.95rem;
       min-width: 0;
     }
+
     button {
-      border: 0;
+      border: 1px solid var(--accent-dark);
       border-radius: 10px;
       background: var(--accent);
-      color: white;
-      padding: 0.75rem 1rem;
+      color: #fff;
       font-weight: 600;
+      padding: 10px 14px;
       cursor: pointer;
     }
-    main {
-      padding: 1rem;
-      display: grid;
-      gap: 0.75rem;
+
+    button.ghost {
+      background: #fff;
+      color: var(--accent-dark);
     }
-    #status {
-      margin: 0;
+
+    .status {
       color: var(--muted);
-      font-size: 0.95rem;
+      font-size: 0.85rem;
+      min-height: 1em;
     }
+
+    .viewport {
+      overflow: hidden;
+      min-height: 70vh;
+    }
+
     iframe {
       width: 100%;
-      height: 65vh;
-      border: 1px solid var(--border);
-      border-radius: 10px;
-      background: white;
+      height: 100%;
+      border: 0;
+      background: #fff;
+    }
+
+    @media (max-width: 900px) {
+      form {
+        grid-template-columns: 1fr;
+      }
+      button {
+        width: 100%;
+      }
     }
   </style>
 </head>
 <body>
-  <section class="frame">
-    <form id="proxy-form" class="toolbar">
-      <input id="target-url" type="url" value="https://example.com" required />
-      <button type="submit">Browse</button>
+  <section class="panel toolbar">
+    <div class="headline">
+      <h1>WebRascal Proxy Outline</h1>
+      <small>Rust + WASM scaffold</small>
+    </div>
+    <form id="proxy-form">
+      <input id="target-url" type="url" required value="https://example.com" />
+      <button type="submit">Open Through Proxy</button>
+      <button type="button" class="ghost" id="install-sw">Install SW</button>
     </form>
-    <main>
-      <p id="status">Loading wasm runtime...</p>
-      <iframe id="proxy-view" title="proxied page"></iframe>
-    </main>
+    <div class="status" id="status">Loading WASM helper...</div>
   </section>
-  <script type="module" src="/bootstrap.js"></script>
+
+  <section class="panel viewport">
+    <iframe id="viewer" title="proxied content"></iframe>
+  </section>
+
+  <script type="module" src="/web/app.js"></script>
 </body>
 </html>
-

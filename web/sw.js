@@ -1,32 +1,32 @@
-const CACHE_NAME = "webrascal-shell-v1";
-const SHELL = ["/", "/bootstrap.js"];
-
-self.addEventListener("install", (event) => {
-  event.waitUntil(caches.open(CACHE_NAME).then((cache) => cache.addAll(SHELL)));
-  self.skipWaiting();
-});
-
-self.addEventListener("activate", (event) => {
-  event.waitUntil(
-    caches.keys().then((keys) =>
-      Promise.all(keys.filter((k) => k !== CACHE_NAME).map((k) => caches.delete(k))),
-    ),
-  );
-  self.clients.claim();
-});
-
+// Scramjet-style shape: route same-origin navigations through proxy tokens.
+// This is intentionally minimal and should be expanded with route policies.
 self.addEventListener("fetch", (event) => {
-  const requestUrl = new URL(event.request.url);
+  const request = event.request;
+  if (request.method !== "GET") return;
 
-  // Outline hook: this is where Scramjet-style request virtualization can be added.
-  if (requestUrl.pathname.startsWith("/proxy/")) {
+  const url = new URL(request.url);
+
+  // Skip proxy internals/static files.
+  if (
+    url.pathname.startsWith("/proxy/") ||
+    url.pathname.startsWith("/web/") ||
+    url.pathname.startsWith("/api/") ||
+    url.pathname === "/healthz"
+  ) {
     return;
   }
 
-  if (event.request.mode === "navigate") {
-    event.respondWith(
-      fetch(event.request).catch(() => caches.match("/")),
-    );
-  }
+  // Intercept top-level navigations only.
+  if (request.mode !== "navigate") return;
+
+  const token = base64Url(url.href);
+  const proxied = `/proxy/${token}`;
+  event.respondWith(fetch(proxied));
 });
 
+function base64Url(input) {
+  const bytes = new TextEncoder().encode(input);
+  let binary = "";
+  for (const b of bytes) binary += String.fromCharCode(b);
+  return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "");
+}
