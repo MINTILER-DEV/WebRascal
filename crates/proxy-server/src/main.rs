@@ -223,6 +223,10 @@ async fn dispatch_upstream(
             ProxyError::Upstream(detail)
         })?;
 
+    if should_handoff_google_verification(&upstream, status, &content_type, &body) {
+        return direct_handoff_response(&upstream);
+    }
+
     if content_type.contains("text/html") {
         let html = String::from_utf8_lossy(&body);
         let rewritten = rewrite_html(&html, &upstream, &state.public_origin);
@@ -235,6 +239,52 @@ async fn dispatch_upstream(
     let mut response = Response::new(Body::from(body));
     *response.status_mut() = status;
     *response.headers_mut() = response_headers;
+    Ok(response)
+}
+
+fn should_handoff_google_verification(
+    upstream: &Url,
+    status: StatusCode,
+    content_type: &str,
+    body: &[u8],
+) -> bool {
+    if !upstream
+        .host_str()
+        .map(|host| host == "google.com" || host.ends_with(".google.com"))
+        .unwrap_or(false)
+    {
+        return false;
+    }
+
+    if upstream.path().starts_with("/sorry/") {
+        return true;
+    }
+
+    if status != StatusCode::FORBIDDEN
+        && status != StatusCode::TOO_MANY_REQUESTS
+        && status != StatusCode::UNAUTHORIZED
+    {
+        return false;
+    }
+
+    if !content_type.contains("text/html") {
+        return false;
+    }
+
+    let preview = String::from_utf8_lossy(body);
+    preview.contains("Our systems have detected unusual traffic")
+}
+
+fn direct_handoff_response(upstream: &Url) -> Result<Response<Body>, ProxyError> {
+    let location = HeaderValue::from_str(upstream.as_str())
+        .map_err(|e| ProxyError::Upstream(format!("failed to build handoff location header: {e}")))?;
+    let mut response = Response::new(Body::empty());
+    *response.status_mut() = StatusCode::FOUND;
+    response.headers_mut().insert(header::LOCATION, location);
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store, max-age=0"),
+    );
     Ok(response)
 }
 
