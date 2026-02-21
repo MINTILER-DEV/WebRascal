@@ -9,6 +9,7 @@ use clap::Parser;
 use proxy_rewriter::{decode_target, encode_target, rewrite_html, rewrite_location_header};
 use reqwest::Client;
 use serde::Deserialize;
+use std::collections::HashSet;
 use std::error::Error as StdError;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -118,18 +119,47 @@ async fn proxy_relative(
     let method = request.method().clone();
     let uri = request.uri().clone();
     let headers = request.headers().clone();
-    let upstream = if let Some(decoded) = upstream_from_bare_token(&uri) {
-        decoded
-    } else {
-        let upstream_context = upstream_from_context(&headers)
-            .ok_or_else(|| ProxyError::BadRequest("missing proxy context (referer/cookie)".to_string()))?;
-        absolutize_relative_target(&upstream_context, &uri)
-            .map_err(|e| ProxyError::BadRequest(format!("invalid relative proxy target: {e}")))?
-    };
     let body_bytes = axum::body::to_bytes(request.into_body(), 16 * 1024 * 1024)
         .await
         .map_err(|e| ProxyError::Upstream(format!("failed reading request body: {e}")))?;
-    dispatch_upstream(&state, upstream, method, headers, body_bytes).await
+
+    if let Some(decoded) = upstream_from_bare_token(&uri) {
+        return dispatch_upstream(&state, decoded, method, headers, body_bytes).await;
+    }
+
+    let mut candidates = upstream_context_candidates(&headers);
+    if candidates.is_empty() {
+        return Err(ProxyError::BadRequest("missing proxy context (referer/cookie)".to_string()));
+    }
+
+    let mut seen = HashSet::new();
+    let mut fallback_404: Option<Response<Body>> = None;
+    for context in candidates.drain(..) {
+        let upstream = absolutize_relative_target(&context, &uri)
+            .map_err(|e| ProxyError::BadRequest(format!("invalid relative proxy target: {e}")))?;
+        if !seen.insert(upstream.to_string()) {
+            continue;
+        }
+
+        let response = dispatch_upstream(
+            &state,
+            upstream,
+            method.clone(),
+            headers.clone(),
+            body_bytes.clone(),
+        )
+        .await?;
+        if response.status() != StatusCode::NOT_FOUND {
+            return Ok(response);
+        }
+        fallback_404 = Some(response);
+    }
+
+    if let Some(response) = fallback_404 {
+        return Ok(response);
+    }
+
+    Err(ProxyError::BadRequest("missing proxy context (referer/cookie)".to_string()))
 }
 
 async fn dispatch_upstream(
@@ -224,26 +254,79 @@ fn upstream_from_context(headers: &HeaderMap) -> Option<Url> {
         return Some(url);
     }
 
-    // Prefer explicit cookie context over referer:
-    // referer can point at proxied script/frame tokens, which causes host drift
-    // for relative paths such as /results.
-    if let Some(cookie) = headers.get(header::COOKIE).and_then(|v| v.to_str().ok()) {
-        for part in cookie.split(';') {
-            let trimmed = part.trim();
-            if let Some(token) = trimmed.strip_prefix("wr_ctx=") {
-                if let Ok(url) = decode_target(token) {
-                    return Some(url);
-                }
-            }
-        }
+    if let Some(url) = upstream_from_referer(headers) {
+        return Some(url);
     }
 
-    upstream_from_referer(headers)
+    upstream_from_cookie(headers)
 }
 
 fn upstream_from_header(headers: &HeaderMap) -> Option<Url> {
     let value = headers.get("x-webrascal-upstream")?.to_str().ok()?;
     Url::parse(value).ok()
+}
+
+fn upstream_from_cookie(headers: &HeaderMap) -> Option<Url> {
+    let cookie = headers.get(header::COOKIE)?.to_str().ok()?;
+    for part in cookie.split(';') {
+        let trimmed = part.trim();
+        if let Some(token) = trimmed.strip_prefix("wr_ctx=") {
+            if let Ok(url) = decode_target(token) {
+                return Some(url);
+            }
+        }
+    }
+    None
+}
+
+fn upstream_context_candidates(headers: &HeaderMap) -> Vec<Url> {
+    let mut out = Vec::new();
+    let navigation_like = is_navigation_like(headers);
+
+    if let Some(url) = upstream_from_header(headers) {
+        out.push(url);
+    }
+
+    if navigation_like {
+        if let Some(url) = upstream_from_referer(headers) {
+            out.push(url);
+        }
+        if let Some(url) = upstream_from_cookie(headers) {
+            out.push(url);
+        }
+    } else {
+        if let Some(url) = upstream_from_cookie(headers) {
+            out.push(url);
+        }
+        if let Some(url) = upstream_from_referer(headers) {
+            out.push(url);
+        }
+    }
+
+    out
+}
+
+fn is_navigation_like(headers: &HeaderMap) -> bool {
+    if let Some(mode) = headers
+        .get("sec-fetch-mode")
+        .and_then(|value| value.to_str().ok())
+    {
+        if mode.eq_ignore_ascii_case("navigate") {
+            return true;
+        }
+    }
+
+    if let Some(dest) = headers
+        .get("sec-fetch-dest")
+        .and_then(|value| value.to_str().ok())
+    {
+        return matches!(
+            dest.to_ascii_lowercase().as_str(),
+            "document" | "iframe" | "frame"
+        );
+    }
+
+    false
 }
 
 fn upstream_from_bare_token(uri: &axum::http::Uri) -> Option<Url> {
@@ -495,10 +578,14 @@ fn should_apply_proxy_context(status: StatusCode, request_headers: &HeaderMap) -
         .get("sec-fetch-dest")
         .and_then(|value| value.to_str().ok())
     {
-        return matches!(
-            dest.to_ascii_lowercase().as_str(),
-            "document" | "iframe" | "frame"
-        );
+        let lower = dest.to_ascii_lowercase();
+        if lower == "document" {
+            return true;
+        }
+        if lower == "iframe" || lower == "frame" {
+            return is_root_embed_request(request_headers);
+        }
+        return false;
     }
 
     request_headers
@@ -506,6 +593,20 @@ fn should_apply_proxy_context(status: StatusCode, request_headers: &HeaderMap) -
         .and_then(|value| value.to_str().ok())
         .map(|accept| accept.contains("text/html"))
         .unwrap_or(false)
+}
+
+fn is_root_embed_request(request_headers: &HeaderMap) -> bool {
+    let Some(raw) = request_headers
+        .get(header::REFERER)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return true;
+    };
+    let Ok(url) = Url::parse(raw) else {
+        return true;
+    };
+    let path = url.path();
+    path == "/" || path == "/index.html"
 }
 
 fn is_hop_by_hop(name: &HeaderName) -> bool {
