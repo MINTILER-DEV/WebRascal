@@ -5,19 +5,24 @@ self.addEventListener("fetch", (event) => {
   if (request.method !== "GET") return;
 
   const url = new URL(request.url);
+  const selfOrigin = self.location.origin;
 
   // Skip proxy internals/static files.
   if (
-    url.pathname.startsWith("/proxy/") ||
-    url.pathname.startsWith("/web/") ||
-    url.pathname.startsWith("/api/") ||
-    url.pathname === "/healthz"
+    url.origin === selfOrigin &&
+    (
+      url.pathname.startsWith("/proxy/") ||
+      url.pathname.startsWith("/web/") ||
+      url.pathname.startsWith("/api/") ||
+      url.pathname === "/healthz" ||
+      url.pathname === "/sw.js"
+    )
   ) {
     return;
   }
 
-  // Intercept top-level navigations only.
-  if (request.mode !== "navigate") return;
+  // Do not intercept same-origin requests to avoid proxying our own local routes.
+  if (url.origin === selfOrigin) return;
 
   const token = base64Url(url.href);
   const proxied = `/proxy/${token}`;

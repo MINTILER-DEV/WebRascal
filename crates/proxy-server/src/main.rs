@@ -246,10 +246,16 @@ fn method_from_axum(method: &Method) -> reqwest::Method {
 
 fn filtered_request_headers(
     input: &HeaderMap,
-    upstream: &Url,
+    target_upstream: &Url,
     proxy_origin: &Url,
 ) -> reqwest::header::HeaderMap {
     let mut out = reqwest::header::HeaderMap::new();
+    let context_upstream = upstream_from_context(input);
+    let referer_base = context_upstream.as_ref().unwrap_or(target_upstream);
+    let rewritten_referer = input
+        .get(header::REFERER)
+        .and_then(|v| rewrite_referer_for_upstream(v, referer_base, proxy_origin));
+
     for (name, value) in input.iter() {
         if is_hop_by_hop(name)
             || name == header::HOST
@@ -267,14 +273,20 @@ fn filtered_request_headers(
         }
 
         if name == header::ORIGIN {
-            if let Ok(origin) = reqwest::header::HeaderValue::from_str(&upstream.origin().ascii_serialization()) {
+            if let Some(origin) = rewrite_origin_for_upstream(
+                value,
+                context_upstream.as_ref(),
+                rewritten_referer.as_ref(),
+                target_upstream,
+                proxy_origin,
+            ) {
                 out.insert(reqwest::header::ORIGIN, origin);
             }
             continue;
         }
 
         if name == header::REFERER {
-            if let Some(referrer) = rewrite_referer_for_upstream(value, upstream, proxy_origin) {
+            if let Some(referrer) = rewritten_referer.clone() {
                 out.insert(reqwest::header::REFERER, referrer);
             }
             continue;
@@ -308,7 +320,7 @@ fn sanitize_cookie_header(value: &HeaderValue) -> Option<reqwest::header::Header
 
 fn rewrite_referer_for_upstream(
     value: &HeaderValue,
-    upstream: &Url,
+    context_upstream: &Url,
     proxy_origin: &Url,
 ) -> Option<reqwest::header::HeaderValue> {
     let raw = value.to_str().ok()?;
@@ -319,7 +331,7 @@ fn rewrite_referer_for_upstream(
             if let Some(token) = ref_url.path().strip_prefix("/proxy/") {
                 decode_target(token).ok().map(|u| u.to_string()).unwrap_or_else(|| raw.to_string())
             } else {
-                let mut mapped = upstream.clone();
+                let mut mapped = context_upstream.clone();
                 mapped.set_path(ref_url.path());
                 mapped.set_query(ref_url.query());
                 mapped.set_fragment(ref_url.fragment());
@@ -333,6 +345,35 @@ fn rewrite_referer_for_upstream(
     };
 
     reqwest::header::HeaderValue::from_str(&rewritten).ok()
+}
+
+fn rewrite_origin_for_upstream(
+    value: &HeaderValue,
+    context_upstream: Option<&Url>,
+    rewritten_referer: Option<&reqwest::header::HeaderValue>,
+    target_upstream: &Url,
+    proxy_origin: &Url,
+) -> Option<reqwest::header::HeaderValue> {
+    let raw = value.to_str().ok()?;
+    let parsed_origin = Url::parse(raw).ok();
+
+    if let Some(origin_url) = parsed_origin {
+        if same_origin(&origin_url, proxy_origin) {
+            if let Some(referrer_value) = rewritten_referer {
+                if let Ok(referrer_str) = referrer_value.to_str() {
+                    if let Ok(referrer_url) = Url::parse(referrer_str) {
+                        let origin = referrer_url.origin().ascii_serialization();
+                        return reqwest::header::HeaderValue::from_str(&origin).ok();
+                    }
+                }
+            }
+            let fallback = context_upstream.unwrap_or(target_upstream);
+            let origin = fallback.origin().ascii_serialization();
+            return reqwest::header::HeaderValue::from_str(&origin).ok();
+        }
+    }
+
+    reqwest::header::HeaderValue::from_bytes(value.as_bytes()).ok()
 }
 
 fn same_origin(a: &Url, b: &Url) -> bool {
