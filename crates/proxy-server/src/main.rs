@@ -224,20 +224,21 @@ fn upstream_from_context(headers: &HeaderMap) -> Option<Url> {
         return Some(url);
     }
 
-    if let Some(url) = upstream_from_referer(headers) {
-        return Some(url);
-    }
-
-    let cookie = headers.get(header::COOKIE)?.to_str().ok()?;
-    for part in cookie.split(';') {
-        let trimmed = part.trim();
-        if let Some(token) = trimmed.strip_prefix("wr_ctx=") {
-            if let Ok(url) = decode_target(token) {
-                return Some(url);
+    // Prefer explicit cookie context over referer:
+    // referer can point at proxied script/frame tokens, which causes host drift
+    // for relative paths such as /results.
+    if let Some(cookie) = headers.get(header::COOKIE).and_then(|v| v.to_str().ok()) {
+        for part in cookie.split(';') {
+            let trimmed = part.trim();
+            if let Some(token) = trimmed.strip_prefix("wr_ctx=") {
+                if let Ok(url) = decode_target(token) {
+                    return Some(url);
+                }
             }
         }
     }
-    None
+
+    upstream_from_referer(headers)
 }
 
 fn upstream_from_header(headers: &HeaderMap) -> Option<Url> {
