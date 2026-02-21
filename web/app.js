@@ -5,8 +5,12 @@ const form = document.getElementById("proxy-form");
 const input = document.getElementById("target-url");
 const viewer = document.getElementById("viewer");
 const swButton = document.getElementById("install-sw");
+const overlay = document.getElementById("overlay");
+const hideOverlayButton = document.getElementById("hide-overlay");
+const showOverlayButton = document.getElementById("show-overlay");
 
 bootWasm();
+setOverlayVisible(true);
 
 form.addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -35,6 +39,13 @@ swButton.addEventListener("click", async () => {
   }
 });
 
+hideOverlayButton.addEventListener("click", () => setOverlayVisible(false));
+showOverlayButton.addEventListener("click", () => setOverlayVisible(true));
+document.addEventListener("keydown", (event) => {
+  if (event.key !== "Escape") return;
+  setOverlayVisible(overlay.classList.contains("hidden"));
+});
+
 async function bootWasm() {
   try {
     const module = await import("/web/pkg/proxy_wasm.js");
@@ -61,4 +72,10 @@ async function buildProxyToken(url) {
 
 function status(message) {
   statusEl.textContent = message;
+}
+
+function setOverlayVisible(visible) {
+  overlay.classList.toggle("hidden", !visible);
+  showOverlayButton.classList.toggle("visible", !visible);
+  if (visible) input.focus();
 }

@@ -51,7 +51,11 @@ pub fn rewrite_html(html: &str, upstream: &Url, proxy_origin: &Url) -> String {
                     .to_string();
             };
 
-            let rewritten = proxy_url(proxy_origin, &joined);
+            let rewritten = if joined.origin() == upstream.origin() {
+                local_proxy_path(&joined)
+            } else {
+                proxy_url(proxy_origin, &joined)
+            };
             format!(r#"{attr}="{rewritten}""#)
         })
         .to_string();
@@ -74,7 +78,11 @@ pub fn rewrite_location_header(headers: &mut HeaderMap, upstream: &Url, proxy_or
         return;
     };
 
-    let rewritten = proxy_url(proxy_origin, &target);
+    let rewritten = if target.origin() == upstream.origin() {
+        local_proxy_path(&target)
+    } else {
+        proxy_url(proxy_origin, &target)
+    };
     if let Ok(value) = rewritten.parse() {
         headers.insert("location", value);
     }
@@ -82,6 +90,19 @@ pub fn rewrite_location_header(headers: &mut HeaderMap, upstream: &Url, proxy_or
 
 pub fn proxy_url(proxy_origin: &Url, target: &Url) -> String {
     format!("{}/proxy/{}", proxy_origin.as_str().trim_end_matches('/'), encode_target(target))
+}
+
+fn local_proxy_path(target: &Url) -> String {
+    let mut out = target.path().to_string();
+    if let Some(query) = target.query() {
+        out.push('?');
+        out.push_str(query);
+    }
+    if let Some(fragment) = target.fragment() {
+        out.push('#');
+        out.push_str(fragment);
+    }
+    out
 }
 
 fn should_skip_rewrite(raw: &str) -> bool {
@@ -145,6 +166,9 @@ fn runtime_shim_script(upstream: &Url, proxy_origin: &Url) -> String {
       const raw = typeof input === "string" ? input : (input && input.url) ? input.url : "";
       if (!raw || skip.test(raw)) return null;
       const resolved = new URL(raw, upstreamBase);
+      if (resolved.origin === upstreamBase.origin) {{
+        return resolved.pathname + resolved.search + resolved.hash;
+      }}
       if (resolved.origin === proxyOrigin) {{
         if (resolved.pathname.startsWith("/proxy/")) return resolved.toString();
         const mapped = new URL(resolved.pathname + resolved.search + resolved.hash, upstreamBase.origin);
@@ -294,6 +318,16 @@ fn runtime_shim_script(upstream: &Url, proxy_origin: &Url) -> String {
         return origReplace.call(this, nextUrl || url);
       }};
     }}
+    if (locProto && typeof locProto.reload === "function") {{
+      const origReload = locProto.reload;
+      locProto.reload = function() {{
+        try {{
+          window.dispatchEvent(new PopStateEvent("popstate", {{ state: window.history ? window.history.state : null }}));
+          return;
+        }} catch (_) {{}}
+        return origReload.call(this);
+      }};
+    }}
     if (locProto) {{
       const hrefDescriptor = Object.getOwnPropertyDescriptor(locProto, "href");
       if (hrefDescriptor && typeof hrefDescriptor.set === "function" && hrefDescriptor.configurable) {{
@@ -378,7 +412,7 @@ mod tests {
         let out = rewrite_html(input, &upstream, &proxy);
 
         assert!(out.contains("http://127.0.0.1:8080/proxy/"));
-        assert!(!out.contains("href=\"/next\""));
+        assert!(out.contains("href=\"/next\""));
     }
 
     #[test]
@@ -393,6 +427,7 @@ mod tests {
         assert!(out.contains("const softNavigate = (input, mode) =>"));
         assert!(out.contains("const patchLocationSetter = (owner, prop, mode) =>"));
         assert!(out.contains("patchLocationSetter(window, \"location\", \"push\")"));
+        assert!(out.contains("locProto.reload = function()"));
         assert!(out.contains("window.dispatchEvent(new PopStateEvent(\"popstate\""));
         assert!(out.contains("</script></head>"));
     }

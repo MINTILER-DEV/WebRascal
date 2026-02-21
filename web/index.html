@@ -6,14 +6,14 @@
   <title>WebRascal Proxy</title>
   <style>
     :root {
-      --bg: #f7f4eb;
-      --panel: #ffffff;
-      --text: #1e1e1e;
-      --muted: #6a6a6a;
-      --accent: #d96f32;
-      --accent-dark: #9b4312;
-      --line: #dad1c5;
-      --shadow: 0 12px 40px rgba(13, 14, 17, 0.1);
+      --bg: #0b1116;
+      --panel: rgba(12, 21, 32, 0.88);
+      --text: #edf2f7;
+      --muted: #9eb3c7;
+      --accent: #2dcf9f;
+      --accent-strong: #169d78;
+      --line: rgba(122, 155, 184, 0.32);
+      --shadow: 0 20px 60px rgba(0, 0, 0, 0.45);
       font-family: "Space Grotesk", "Segoe UI", sans-serif;
     }
 
@@ -23,76 +23,123 @@
 
     body {
       margin: 0;
-      min-height: 100vh;
+      width: 100vw;
+      height: 100vh;
+      overflow: hidden;
       color: var(--text);
       background:
-        radial-gradient(circle at 15% 20%, #ffe4cb 0%, transparent 35%),
-        radial-gradient(circle at 85% 80%, #c6e9e9 0%, transparent 38%),
-        var(--bg);
-      display: grid;
-      grid-template-rows: auto 1fr;
-      gap: 12px;
-      padding: 16px;
+        radial-gradient(circle at 12% 16%, rgba(45, 207, 159, 0.22), transparent 30%),
+        radial-gradient(circle at 85% 10%, rgba(28, 92, 154, 0.3), transparent 35%),
+        linear-gradient(180deg, #0b1116 0%, #05090d 100%);
     }
 
-    .panel {
+    #viewer {
+      position: fixed;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      border: 0;
+      background: #fff;
+    }
+
+    .chrome {
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      z-index: 10;
+    }
+
+    .overlay {
+      pointer-events: auto;
+      position: absolute;
+      top: 18px;
+      left: 50%;
+      width: min(1020px, calc(100vw - 24px));
+      transform: translateX(-50%) translateY(0);
+      opacity: 1;
+      transition: transform 300ms ease, opacity 220ms ease;
       background: var(--panel);
       border: 1px solid var(--line);
       border-radius: 16px;
       box-shadow: var(--shadow);
-    }
-
-    .toolbar {
-      padding: 14px;
+      backdrop-filter: blur(8px);
+      padding: 12px;
       display: grid;
       gap: 10px;
+      animation: overlay-enter 420ms cubic-bezier(0.2, 0.7, 0, 1);
+    }
+
+    .overlay.hidden {
+      opacity: 0;
+      transform: translateX(-50%) translateY(-130%);
+      pointer-events: none;
+    }
+
+    @keyframes overlay-enter {
+      from {
+        opacity: 0;
+        transform: translateX(-50%) translateY(-24px) scale(0.98);
+      }
+      to {
+        opacity: 1;
+        transform: translateX(-50%) translateY(0) scale(1);
+      }
     }
 
     .headline {
       display: flex;
       align-items: baseline;
       justify-content: space-between;
-      gap: 8px;
+      gap: 10px;
     }
 
     .headline h1 {
       margin: 0;
-      font-size: 1.1rem;
+      font-size: 1rem;
       letter-spacing: 0.02em;
     }
 
     .headline small {
       color: var(--muted);
-      font-size: 0.8rem;
+      font-size: 0.78rem;
     }
 
-    form {
+    .controls {
       display: grid;
-      grid-template-columns: 1fr auto auto;
+      grid-template-columns: 1fr auto;
       gap: 8px;
     }
 
     input[type="url"] {
       border: 1px solid var(--line);
-      border-radius: 10px;
-      padding: 10px 12px;
+      border-radius: 9px;
+      padding: 11px 12px;
       font-size: 0.95rem;
       min-width: 0;
+      background: rgba(9, 14, 22, 0.8);
+      color: var(--text);
     }
 
     button {
-      border: 1px solid var(--accent-dark);
-      border-radius: 10px;
+      border: 1px solid transparent;
+      border-radius: 9px;
       background: var(--accent);
-      color: #fff;
+      color: #052c21;
       font-weight: 600;
-      padding: 10px 14px;
+      padding: 10px 13px;
       cursor: pointer;
+      transition: transform 120ms ease, filter 120ms ease, background 160ms ease;
     }
 
-    button.ghost {
-      background: #fff;
-      color: var(--accent-dark);
+    button:hover {
+      filter: brightness(1.05);
+      transform: translateY(-1px);
+    }
+
+    button.secondary {
+      background: transparent;
+      color: var(--text);
+      border-color: var(--line);
     }
 
     .status {
@@ -101,45 +148,65 @@
       min-height: 1em;
     }
 
-    .viewport {
-      overflow: hidden;
-      min-height: 70vh;
+    .quick-actions {
+      display: flex;
+      gap: 8px;
     }
 
-    iframe {
-      width: 100%;
-      height: 100%;
-      border: 0;
-      background: #fff;
+    .show-overlay {
+      pointer-events: auto;
+      position: absolute;
+      top: 14px;
+      left: 50%;
+      transform: translateX(-50%) translateY(-14px);
+      opacity: 0;
+      background: rgba(12, 21, 32, 0.92);
+      color: var(--text);
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 8px 14px;
+      transition: opacity 220ms ease, transform 220ms ease;
+    }
+
+    .show-overlay.visible {
+      opacity: 1;
+      transform: translateX(-50%) translateY(0);
     }
 
     @media (max-width: 900px) {
-      form {
+      .overlay {
+        top: 10px;
+      }
+      .controls {
         grid-template-columns: 1fr;
       }
-      button {
-        width: 100%;
+      .quick-actions {
+        flex-wrap: wrap;
       }
     }
   </style>
 </head>
 <body>
-  <section class="panel toolbar">
-    <div class="headline">
-      <h1>WebRascal Proxy Outline</h1>
-      <small>Rust + WASM scaffold</small>
-    </div>
-    <form id="proxy-form">
-      <input id="target-url" type="url" required value="https://example.com" />
-      <button type="submit">Open Through Proxy</button>
-      <button type="button" class="ghost" id="install-sw">Install SW</button>
-    </form>
-    <div class="status" id="status">Loading WASM helper...</div>
-  </section>
+  <iframe id="viewer" title="proxied content"></iframe>
 
-  <section class="panel viewport">
-    <iframe id="viewer" title="proxied content"></iframe>
-  </section>
+  <div class="chrome">
+    <section class="overlay" id="overlay">
+      <div class="headline">
+        <h1>WebRascal</h1>
+        <small>Proxy Overlay</small>
+      </div>
+      <form id="proxy-form" class="controls">
+        <input id="target-url" type="url" required value="https://example.com" />
+        <button type="submit">Open</button>
+      </form>
+      <div class="quick-actions">
+        <button type="button" class="secondary" id="install-sw">Install SW</button>
+        <button type="button" class="secondary" id="hide-overlay">Hide Bar</button>
+      </div>
+      <div class="status" id="status">Loading WASM helper...</div>
+    </section>
+    <button type="button" class="show-overlay" id="show-overlay">Show URL Bar</button>
+  </div>
 
   <script type="module" src="/web/app.js"></script>
 </body>
