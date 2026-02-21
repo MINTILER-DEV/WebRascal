@@ -109,6 +109,17 @@ fn attr_regex() -> &'static Regex {
 
 fn inject_runtime_shim(html: &str, upstream: &Url, proxy_origin: &Url) -> String {
     let script = runtime_shim_script(upstream, proxy_origin);
+    let lower = html.to_ascii_lowercase();
+    if let Some(head_idx) = lower.find("<head") {
+        if let Some(head_end_rel) = lower[head_idx..].find('>') {
+            let insert_at = head_idx + head_end_rel + 1;
+            let mut out = String::with_capacity(html.len() + script.len() + 1);
+            out.push_str(&html[..insert_at]);
+            out.push_str(&script);
+            out.push_str(&html[insert_at..]);
+            return out;
+        }
+    }
     if let Some(idx) = html.find("</head>") {
         let mut out = String::with_capacity(html.len() + script.len() + 1);
         out.push_str(&html[..idx]);
@@ -256,6 +267,94 @@ fn runtime_shim_script(upstream: &Url, proxy_origin: &Url) -> String {
       }}));
     }} catch (_) {{}}
   }};
+  const mapPingList = (value) => {{
+    const raw = toRaw(value).trim();
+    if (!raw) return value;
+    return raw
+      .split(/\s+/)
+      .map((part) => toProxy(part) || part)
+      .join(" ");
+  }};
+  const mapSrcset = (value) => {{
+    const raw = toRaw(value);
+    if (!raw) return value;
+    return raw
+      .split(",")
+      .map((candidate) => {{
+        const trimmed = candidate.trim();
+        if (!trimmed) return candidate;
+        const parts = trimmed.split(/\s+/);
+        const source = parts[0];
+        const mapped = toProxy(source) || source;
+        parts[0] = mapped;
+        return parts.join(" ");
+      }})
+      .join(", ");
+  }};
+  const mapAttrValue = (el, name, value) => {{
+    const attr = String(name || "").toLowerCase().split(":").pop();
+    if (!attr) return value;
+    if (attr === "srcset") return mapSrcset(value);
+    if (attr === "ping") return mapPingList(value);
+    if (attr === "href" || attr === "action" || attr === "formaction") {{
+      return toNavigable(value) || value;
+    }}
+    if (attr === "src" || attr === "poster" || attr === "data") {{
+      return toProxy(value) || value;
+    }}
+    return value;
+  }};
+  const patchAttributeSetters = () => {{
+    try {{
+      const origSetAttribute = Element.prototype.setAttribute;
+      Element.prototype.setAttribute = function(name, value) {{
+        const mapped = mapAttrValue(this, name, value);
+        return origSetAttribute.call(this, name, mapped);
+      }};
+    }} catch (_) {{}}
+    try {{
+      const origSetAttributeNS = Element.prototype.setAttributeNS;
+      Element.prototype.setAttributeNS = function(ns, name, value) {{
+        const mapped = mapAttrValue(this, name, value);
+        return origSetAttributeNS.call(this, ns, name, mapped);
+      }};
+    }} catch (_) {{}}
+  }};
+  const patchFormSubmissions = () => {{
+    try {{
+      const proxifyForm = (form, submitter) => {{
+        if (!(form instanceof HTMLFormElement)) return;
+        const action = form.getAttribute("action") || window.location.href;
+        const mappedAction = toNavigable(action);
+        if (mappedAction) form.setAttribute("action", mappedAction);
+        if (submitter && typeof submitter.getAttribute === "function") {{
+          const formAction = submitter.getAttribute("formaction");
+          if (formAction) {{
+            const mappedFormAction = toNavigable(formAction);
+            if (mappedFormAction && typeof submitter.setAttribute === "function") {{
+              submitter.setAttribute("formaction", mappedFormAction);
+            }}
+          }}
+        }}
+      }};
+
+      if (typeof HTMLFormElement !== "undefined") {{
+        const origSubmit = HTMLFormElement.prototype.submit;
+        HTMLFormElement.prototype.submit = function() {{
+          try {{ proxifyForm(this, null); }} catch (_) {{}}
+          return origSubmit.call(this);
+        }};
+
+        if (typeof HTMLFormElement.prototype.requestSubmit === "function") {{
+          const origRequestSubmit = HTMLFormElement.prototype.requestSubmit;
+          HTMLFormElement.prototype.requestSubmit = function(submitter) {{
+            try {{ proxifyForm(this, submitter || null); }} catch (_) {{}}
+            return origRequestSubmit.call(this, submitter);
+          }};
+        }}
+      }}
+    }} catch (_) {{}}
+  }};
   const origFetch = window.fetch;
   window.fetch = function(input, init) {{
     let nextInit = init;
@@ -395,13 +494,22 @@ fn runtime_shim_script(upstream: &Url, proxy_origin: &Url) -> String {
     patchLocationSetter(winProto, "location", "push");
     patchLocationSetter(Document.prototype, "location", "push");
   }} catch (_) {{}}
+  patchAttributeSetters();
+  patchFormSubmissions();
   try {{
     patchResourceSetter(typeof HTMLImageElement !== "undefined" ? HTMLImageElement.prototype : null, "src", toProxy);
+    patchResourceSetter(typeof HTMLImageElement !== "undefined" ? HTMLImageElement.prototype : null, "srcset", mapSrcset);
     patchResourceSetter(typeof HTMLScriptElement !== "undefined" ? HTMLScriptElement.prototype : null, "src", toProxy);
     patchResourceSetter(typeof HTMLIFrameElement !== "undefined" ? HTMLIFrameElement.prototype : null, "src", toProxy);
     patchResourceSetter(typeof HTMLMediaElement !== "undefined" ? HTMLMediaElement.prototype : null, "src", toProxy);
     patchResourceSetter(typeof HTMLSourceElement !== "undefined" ? HTMLSourceElement.prototype : null, "src", toProxy);
+    patchResourceSetter(typeof HTMLSourceElement !== "undefined" ? HTMLSourceElement.prototype : null, "srcset", mapSrcset);
     patchResourceSetter(typeof HTMLLinkElement !== "undefined" ? HTMLLinkElement.prototype : null, "href", toProxy);
+    patchResourceSetter(typeof HTMLAnchorElement !== "undefined" ? HTMLAnchorElement.prototype : null, "href", toNavigable);
+    patchResourceSetter(typeof HTMLAnchorElement !== "undefined" ? HTMLAnchorElement.prototype : null, "ping", mapPingList);
+    patchResourceSetter(typeof HTMLFormElement !== "undefined" ? HTMLFormElement.prototype : null, "action", toNavigable);
+    patchResourceSetter(typeof HTMLButtonElement !== "undefined" ? HTMLButtonElement.prototype : null, "formAction", toNavigable);
+    patchResourceSetter(typeof HTMLInputElement !== "undefined" ? HTMLInputElement.prototype : null, "formAction", toNavigable);
   }} catch (_) {{}}
   document.addEventListener("submit", (event) => {{
     try {{
@@ -466,6 +574,9 @@ mod tests {
         let input = r#"<html><head></head><body>ok</body></html>"#;
         let out = rewrite_html(input, &upstream, &proxy);
         assert!(out.contains("window.fetch = function"));
+        assert!(out.contains("const patchAttributeSetters = () =>"));
+        assert!(out.contains("const patchFormSubmissions = () =>"));
+        assert!(out.contains("Element.prototype.setAttribute = function(name, value)"));
         assert!(out.contains("document.addEventListener(\"submit\""));
         assert!(out.contains("window.history.pushState"));
         assert!(out.contains("const resolveUrl = (input) =>"));
@@ -477,8 +588,10 @@ mod tests {
         assert!(out.contains("const patchResourceSetter = (proto, prop, mapper) =>"));
         assert!(out.contains("patchLocationSetter(window, \"location\", \"push\")"));
         assert!(out.contains("patchResourceSetter(typeof HTMLImageElement"));
+        assert!(out.contains("patchResourceSetter(typeof HTMLAnchorElement"));
+        assert!(out.contains("patchResourceSetter(typeof HTMLFormElement"));
         assert!(out.contains("locProto.reload = function()"));
         assert!(out.contains("window.dispatchEvent(new PopStateEvent(\"popstate\""));
-        assert!(out.contains("</script></head>"));
+        assert!(out.contains("<head><script>"));
     }
 }
