@@ -173,14 +173,24 @@ fn runtime_shim_script(upstream: &Url, proxy_origin: &Url) -> String {
     if (appPath) return appPath;
     return toProxy(input);
   }};
-  const toProxyPath = (input) => {{
-    const proxied = toProxy(input);
-    if (!proxied) return null;
+  const currentPath = () => window.location.pathname + window.location.search + window.location.hash;
+  const softNavigate = (input, mode) => {{
+    const appPath = toAppPath(input);
+    if (!appPath) return false;
+    if (appPath === currentPath()) return true;
     try {{
-      const parsed = new URL(proxied, proxyOrigin);
-      return parsed.pathname + parsed.search + parsed.hash;
+      if (!window.history) return false;
+      if (mode === "replace" && typeof window.history.replaceState === "function") {{
+        window.history.replaceState(window.history.state, "", appPath);
+      }} else if (typeof window.history.pushState === "function") {{
+        window.history.pushState(window.history.state, "", appPath);
+      }} else {{
+        return false;
+      }}
+      window.dispatchEvent(new PopStateEvent("popstate", {{ state: window.history.state }}));
+      return true;
     }} catch (_) {{
-      return proxied;
+      return false;
     }}
   }};
   const origFetch = window.fetch;
@@ -256,6 +266,7 @@ fn runtime_shim_script(upstream: &Url, proxy_origin: &Url) -> String {
     if (locProto && typeof locProto.assign === "function") {{
       const origAssign = locProto.assign;
       locProto.assign = function(url) {{
+        if (softNavigate(url, "push")) return;
         const nextUrl = toNavigable(url);
         return origAssign.call(this, nextUrl || url);
       }};
@@ -263,9 +274,34 @@ fn runtime_shim_script(upstream: &Url, proxy_origin: &Url) -> String {
     if (locProto && typeof locProto.replace === "function") {{
       const origReplace = locProto.replace;
       locProto.replace = function(url) {{
+        if (softNavigate(url, "replace")) return;
         const nextUrl = toNavigable(url);
         return origReplace.call(this, nextUrl || url);
       }};
+    }}
+    if (locProto) {{
+      const hrefDescriptor = Object.getOwnPropertyDescriptor(locProto, "href");
+      if (hrefDescriptor && typeof hrefDescriptor.set === "function" && hrefDescriptor.configurable) {{
+        const origHrefSet = hrefDescriptor.set;
+        Object.defineProperty(locProto, "href", Object.assign({{}}, hrefDescriptor, {{
+          set(value) {{
+            if (softNavigate(value, "push")) return;
+            const nextUrl = toNavigable(value);
+            return origHrefSet.call(this, nextUrl || value);
+          }}
+        }}));
+      }}
+
+      const pathnameDescriptor = Object.getOwnPropertyDescriptor(locProto, "pathname");
+      if (pathnameDescriptor && typeof pathnameDescriptor.set === "function" && pathnameDescriptor.configurable) {{
+        const origPathSet = pathnameDescriptor.set;
+        Object.defineProperty(locProto, "pathname", Object.assign({{}}, pathnameDescriptor, {{
+          set(value) {{
+            if (softNavigate(String(value || ""), "push")) return;
+            return origPathSet.call(this, value);
+          }}
+        }}));
+      }}
     }}
   }} catch (_) {{}}
   document.addEventListener("submit", (event) => {{
@@ -333,6 +369,8 @@ mod tests {
         assert!(out.contains("window.fetch = function"));
         assert!(out.contains("document.addEventListener(\"submit\""));
         assert!(out.contains("window.history.pushState"));
+        assert!(out.contains("const softNavigate = (input, mode) =>"));
+        assert!(out.contains("window.dispatchEvent(new PopStateEvent(\"popstate\""));
         assert!(out.contains("</script></head>"));
     }
 }
