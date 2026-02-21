@@ -1,41 +1,45 @@
-let wasm = null;
-
-const statusEl = document.getElementById("status");
 const form = document.getElementById("proxy-form");
 const input = document.getElementById("target-url");
 const viewer = document.getElementById("viewer");
+const statusEl = document.getElementById("status");
 const swButton = document.getElementById("install-sw");
 const overlay = document.getElementById("overlay");
 const hideOverlayButton = document.getElementById("hide-overlay");
 const showOverlayButton = document.getElementById("show-overlay");
 
-bootWasm();
-setOverlayVisible(true);
+const SESSION_KEY = "wr.sid";
+const sessionId = ensureSessionId();
+let currentRegistration = null;
 
-form.addEventListener("submit", async (event) => {
-  event.preventDefault();
-  const rawUrl = input.value.trim();
-  if (!rawUrl) return;
+boot();
 
-  try {
-    const token = await buildProxyToken(rawUrl);
-    viewer.src = `/proxy/${token}`;
-    status("Proxying: " + rawUrl);
-  } catch (error) {
-    status("Could not proxy URL: " + String(error));
+async function boot() {
+  setOverlayVisible(true);
+  await ensureServiceWorker();
+  postSessionToServiceWorker();
+  if (!navigator.serviceWorker.controller) {
+    status("Service worker installed. Reload this page once to fully activate proxy interception.");
+    return;
   }
+  status(`Session ${sessionId.slice(0, 8)} ready.`);
+}
+
+form.addEventListener("submit", (event) => {
+  event.preventDefault();
+  const raw = normalizeUrl(input.value.trim());
+  if (!raw) return;
+
+  viewer.src = buildProxyPath(raw, sessionId);
+  status("Proxying: " + raw);
 });
 
 swButton.addEventListener("click", async () => {
-  if (!("serviceWorker" in navigator)) {
-    status("Service worker is not supported in this browser.");
-    return;
-  }
   try {
-    await navigator.serviceWorker.register("/sw.js", { scope: "/" });
-    status("Service worker registered.");
+    await ensureServiceWorker(true);
+    postSessionToServiceWorker();
+    status("Service worker refreshed.");
   } catch (error) {
-    status("Service worker registration failed: " + String(error));
+    status("Service worker install failed: " + String(error));
   }
 });
 
@@ -46,28 +50,60 @@ document.addEventListener("keydown", (event) => {
   setOverlayVisible(overlay.classList.contains("hidden"));
 });
 
-async function bootWasm() {
-  try {
-    const module = await import("/web/pkg/proxy_wasm.js");
-    await module.default();
-    wasm = module;
-    status("WASM helper loaded.");
-  } catch (_) {
-    status("WASM helper not found. Falling back to server encode API.");
-  }
+function ensureSessionId() {
+  const existing = sessionStorage.getItem(SESSION_KEY);
+  if (existing) return existing;
+
+  const raw = crypto.randomUUID().replace(/[^a-zA-Z0-9_-]/g, "");
+  const sid = raw.slice(0, 32) || `sid${Date.now()}`;
+  sessionStorage.setItem(SESSION_KEY, sid);
+  return sid;
 }
 
-async function buildProxyToken(url) {
-  if (wasm?.encode_target_url) {
-    return wasm.encode_target_url(url);
+async function ensureServiceWorker(force = false) {
+  if (!("serviceWorker" in navigator)) {
+    throw new Error("Service worker unsupported in this browser.");
   }
 
-  const response = await fetch(`/api/encode?url=${encodeURIComponent(url)}`);
-  if (!response.ok) {
-    throw new Error(`encode API failed with ${response.status}`);
+  const registration = await navigator.serviceWorker.register("/sw.js", { scope: "/" });
+  currentRegistration = registration;
+  if (force) {
+    await registration.update();
   }
-  const data = await response.json();
-  return data.token;
+
+  return registration;
+}
+
+function postSessionToServiceWorker() {
+  const payload = {
+    type: "wr:session",
+    sid: sessionId,
+  };
+
+  if (navigator.serviceWorker?.controller) {
+    navigator.serviceWorker.controller.postMessage(payload);
+    return;
+  }
+
+  const fallback = currentRegistration?.active || currentRegistration?.waiting || currentRegistration?.installing;
+  fallback?.postMessage(payload);
+}
+
+function normalizeUrl(raw) {
+  if (!raw) return "";
+  if (/^[a-zA-Z][a-zA-Z\d+.-]*:/.test(raw)) return raw;
+  return `https://${raw}`;
+}
+
+function buildProxyPath(targetUrl, sid) {
+  return `/proxy/${base64Url(targetUrl)}?sid=${encodeURIComponent(sid)}`;
+}
+
+function base64Url(input) {
+  const bytes = new TextEncoder().encode(input);
+  let binary = "";
+  for (const b of bytes) binary += String.fromCharCode(b);
+  return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "");
 }
 
 function status(message) {

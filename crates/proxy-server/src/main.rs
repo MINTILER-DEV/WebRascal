@@ -6,13 +6,13 @@ use axum::response::{Html, IntoResponse};
 use axum::routing::{any, get};
 use axum::{Json, Router};
 use clap::Parser;
-use proxy_rewriter::{decode_target, encode_target, rewrite_html, rewrite_location_header};
+use proxy_rewriter::{decode_target, encode_target};
 use reqwest::Client;
 use serde::Deserialize;
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::error::Error as StdError;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tower_http::services::ServeDir;
 use tracing::{error, info};
 use url::Url;
@@ -21,21 +21,40 @@ use url::Url;
 struct Args {
     #[arg(long, default_value = "127.0.0.1:8080")]
     listen: SocketAddr,
-    #[arg(long, default_value = "http://127.0.0.1:8080")]
-    public_origin: Url,
-    #[arg(long, default_value_t = false)]
-    insecure: bool,
+}
+
+#[derive(Default)]
+struct CookieStore {
+    sessions: HashMap<String, SessionCookies>,
+}
+
+#[derive(Default)]
+struct SessionCookies {
+    domains: HashMap<String, HashMap<String, String>>,
 }
 
 #[derive(Clone)]
 struct AppState {
     client: Client,
-    public_origin: Url,
+    cookies: Arc<Mutex<CookieStore>>,
 }
 
 #[derive(Debug, Deserialize)]
 struct EncodeQuery {
     url: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProxyQuery {
+    sid: Option<String>,
+}
+
+#[derive(Debug)]
+struct ParsedSetCookie {
+    domain: String,
+    name: String,
+    value: String,
+    delete: bool,
 }
 
 #[tokio::main]
@@ -45,19 +64,14 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let args = Args::parse();
-    let mut client_builder = Client::builder().redirect(reqwest::redirect::Policy::none());
-    if args.insecure {
-        info!("TLS certificate verification disabled via --insecure");
-        client_builder = client_builder.danger_accept_invalid_certs(true);
-    }
-
-    let client = client_builder
+    let client = Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .context("failed building reqwest client")?;
 
     let state = AppState {
         client,
-        public_origin: args.public_origin,
+        cookies: Arc::new(Mutex::new(CookieStore::default())),
     };
 
     let app = Router::new()
@@ -67,7 +81,6 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/encode", get(encode))
         .route("/proxy/:token", any(proxy))
         .nest_service("/web", ServeDir::new("web"))
-        .route("/*path", any(proxy_relative))
         .with_state(Arc::new(state));
 
     info!("proxy server listening on {}", args.listen);
@@ -101,363 +114,110 @@ async fn encode(Query(query): Query<EncodeQuery>) -> Result<Json<serde_json::Val
 async fn proxy(
     State(state): State<Arc<AppState>>,
     Path(token): Path<String>,
+    Query(query): Query<ProxyQuery>,
     request: Request<Body>,
 ) -> Result<Response<Body>, ProxyError> {
     let upstream = decode_target(&token).map_err(|_| ProxyError::BadRequest("invalid proxy token".to_string()))?;
-    let method = request.method().clone();
-    let headers = request.headers().clone();
-    let body_bytes = axum::body::to_bytes(request.into_body(), 16 * 1024 * 1024)
-        .await
-        .map_err(|e| ProxyError::Upstream(format!("failed reading request body: {e}")))?;
-    dispatch_upstream(&state, upstream, method, headers, body_bytes).await
-}
+    let sid = sanitize_sid(query.sid);
 
-async fn proxy_relative(
-    State(state): State<Arc<AppState>>,
-    request: Request<Body>,
-) -> Result<Response<Body>, ProxyError> {
     let method = request.method().clone();
-    let uri = request.uri().clone();
     let headers = request.headers().clone();
-    let body_bytes = axum::body::to_bytes(request.into_body(), 16 * 1024 * 1024)
+    let body = axum::body::to_bytes(request.into_body(), 32 * 1024 * 1024)
         .await
         .map_err(|e| ProxyError::Upstream(format!("failed reading request body: {e}")))?;
 
-    if let Some(decoded) = upstream_from_bare_token(&uri) {
-        return dispatch_upstream(&state, decoded, method, headers, body_bytes).await;
-    }
-
-    let mut candidates = upstream_context_candidates(&headers);
-    if candidates.is_empty() {
-        return Err(ProxyError::BadRequest("missing proxy context (referer/cookie)".to_string()));
-    }
-
-    let mut seen = HashSet::new();
-    let mut fallback_404: Option<Response<Body>> = None;
-    for context in candidates.drain(..) {
-        let upstream = absolutize_relative_target(&context, &uri)
-            .map_err(|e| ProxyError::BadRequest(format!("invalid relative proxy target: {e}")))?;
-        if !seen.insert(upstream.to_string()) {
-            continue;
-        }
-
-        let response = dispatch_upstream(
-            &state,
-            upstream,
-            method.clone(),
-            headers.clone(),
-            body_bytes.clone(),
-        )
-        .await?;
-        if response.status() != StatusCode::NOT_FOUND {
-            return Ok(response);
-        }
-        fallback_404 = Some(response);
-    }
-
-    if let Some(response) = fallback_404 {
-        return Ok(response);
-    }
-
-    Err(ProxyError::BadRequest("missing proxy context (referer/cookie)".to_string()))
+    dispatch_upstream(&state, &sid, upstream, method, headers, body).await
 }
 
 async fn dispatch_upstream(
     state: &AppState,
+    sid: &str,
     upstream: Url,
     method: Method,
     headers: HeaderMap,
-    body_bytes: axum::body::Bytes,
+    body: axum::body::Bytes,
 ) -> Result<Response<Body>, ProxyError> {
-    let is_googlevideo = upstream
-        .host_str()
-        .map(|h| h.ends_with("googlevideo.com"))
-        .unwrap_or(false);
-
     let mut outgoing = state.client.request(method_from_axum(&method), upstream.clone());
-    outgoing = outgoing.headers(filtered_request_headers(
-        &headers,
-        &upstream,
-        &state.public_origin,
-        is_googlevideo,
-    ));
-    if !body_bytes.is_empty() {
-        outgoing = outgoing.body(body_bytes);
+    outgoing = outgoing.headers(filtered_request_headers(&headers, &upstream, sid, &state.cookies)?);
+
+    if !body.is_empty() {
+        outgoing = outgoing.body(body);
     } else if method == Method::POST || method == Method::PUT || method == Method::PATCH {
-        // Some upstreams require explicit content-length for empty entity requests.
         outgoing = outgoing.header(reqwest::header::CONTENT_LENGTH, "0");
         outgoing = outgoing.body(Vec::new());
     }
 
-    let upstream_res = outgoing
-        .send()
-        .await
-        .map_err(|e| {
-            let detail = describe_reqwest_error("send", &method, &upstream, &e);
-            error!("{detail}");
-            ProxyError::Upstream(detail)
-        })?;
+    let upstream_res = outgoing.send().await.map_err(|e| {
+        let detail = describe_reqwest_error("send", &method, &upstream, &e);
+        error!("{detail}");
+        ProxyError::Upstream(detail)
+    })?;
+
+    store_set_cookies(&state.cookies, sid, &upstream, upstream_res.headers());
 
     let status = upstream_res.status();
-    let mut response_headers = filtered_response_headers(upstream_res.headers());
-    rewrite_location_header(&mut response_headers, &upstream, &state.public_origin);
-
-    let content_type = upstream_res
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-    if content_type.contains("text/html") {
-        if should_apply_proxy_context(status, &headers) {
-            apply_proxy_context_headers(&mut response_headers, &upstream);
-        }
+    let mut out_headers = filtered_response_headers(upstream_res.headers());
+    rewrite_location_header(&mut out_headers, &upstream, sid);
+    if let Ok(value) = HeaderValue::from_str(upstream.as_str()) {
+        out_headers.insert(HeaderName::from_static("x-wr-upstream"), value);
     }
 
     let body = upstream_res
         .bytes()
         .await
-        .map_err(|e| {
-            let detail = format!("failed reading upstream body: {e}");
-            error!("{detail}");
-            ProxyError::Upstream(detail)
-        })?;
-
-    if should_handoff_google_verification(&upstream, status, &content_type, &body) {
-        return direct_handoff_response(&upstream);
-    }
-
-    if content_type.contains("text/html") {
-        let html = String::from_utf8_lossy(&body);
-        let rewritten = rewrite_html(&html, &upstream, &state.public_origin);
-        let mut response = Response::new(Body::from(rewritten));
-        *response.status_mut() = status;
-        *response.headers_mut() = response_headers;
-        return Ok(response);
-    }
+        .map_err(|e| ProxyError::Upstream(format!("failed reading upstream body: {e}")))?;
 
     let mut response = Response::new(Body::from(body));
     *response.status_mut() = status;
-    *response.headers_mut() = response_headers;
+    *response.headers_mut() = out_headers;
     Ok(response)
 }
 
-fn should_handoff_google_verification(
-    upstream: &Url,
-    status: StatusCode,
-    content_type: &str,
-    body: &[u8],
-) -> bool {
-    if !upstream
-        .host_str()
-        .map(|host| host == "google.com" || host.ends_with(".google.com"))
-        .unwrap_or(false)
-    {
-        return false;
-    }
-
-    if upstream.path().starts_with("/sorry/") {
-        return true;
-    }
-
-    if status != StatusCode::FORBIDDEN
-        && status != StatusCode::TOO_MANY_REQUESTS
-        && status != StatusCode::UNAUTHORIZED
-    {
-        return false;
-    }
-
-    if !content_type.contains("text/html") {
-        return false;
-    }
-
-    let preview = String::from_utf8_lossy(body);
-    preview.contains("Our systems have detected unusual traffic")
-}
-
-fn direct_handoff_response(upstream: &Url) -> Result<Response<Body>, ProxyError> {
-    let location = HeaderValue::from_str(upstream.as_str())
-        .map_err(|e| ProxyError::Upstream(format!("failed to build handoff location header: {e}")))?;
-    let mut response = Response::new(Body::empty());
-    *response.status_mut() = StatusCode::FOUND;
-    response.headers_mut().insert(header::LOCATION, location);
-    response.headers_mut().insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static("no-store, max-age=0"),
-    );
-    Ok(response)
-}
-
-fn upstream_from_referer(headers: &HeaderMap) -> Option<Url> {
-    let referer = headers.get(header::REFERER)?.to_str().ok()?;
-    let referer_url = Url::parse(referer).ok()?;
-    let mut parts = referer_url.path().trim_start_matches('/').split('/');
-    let first = parts.next()?;
-    if first != "proxy" {
-        return None;
-    }
-    let token = parts.next()?;
-    decode_target(token).ok()
-}
-
-fn upstream_from_context(headers: &HeaderMap) -> Option<Url> {
-    if let Some(url) = upstream_from_header(headers) {
-        return Some(url);
-    }
-
-    if let Some(url) = upstream_from_referer(headers) {
-        return Some(url);
-    }
-
-    upstream_from_cookie(headers)
-}
-
-fn upstream_from_header(headers: &HeaderMap) -> Option<Url> {
-    let value = headers.get("x-webrascal-upstream")?.to_str().ok()?;
-    Url::parse(value).ok()
-}
-
-fn upstream_from_cookie(headers: &HeaderMap) -> Option<Url> {
-    let cookie = headers.get(header::COOKIE)?.to_str().ok()?;
-    for part in cookie.split(';') {
-        let trimmed = part.trim();
-        if let Some(token) = trimmed.strip_prefix("wr_ctx=") {
-            if let Ok(url) = decode_target(token) {
-                return Some(url);
-            }
+fn sanitize_sid(raw: Option<String>) -> String {
+    let mut out = String::new();
+    for ch in raw.unwrap_or_default().chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+            out.push(ch);
+        }
+        if out.len() >= 64 {
+            break;
         }
     }
-    None
-}
-
-fn upstream_context_candidates(headers: &HeaderMap) -> Vec<Url> {
-    let mut out = Vec::new();
-    let navigation_like = is_navigation_like(headers);
-
-    if let Some(url) = upstream_from_header(headers) {
-        out.push(url);
-    }
-
-    if navigation_like {
-        if let Some(url) = upstream_from_referer(headers) {
-            out.push(url);
-        }
-        if let Some(url) = upstream_from_cookie(headers) {
-            out.push(url);
-        }
+    if out.is_empty() {
+        "default".to_string()
     } else {
-        if let Some(url) = upstream_from_cookie(headers) {
-            out.push(url);
-        }
-        if let Some(url) = upstream_from_referer(headers) {
-            out.push(url);
-        }
+        out
     }
-
-    out
-}
-
-fn is_navigation_like(headers: &HeaderMap) -> bool {
-    if let Some(mode) = headers
-        .get("sec-fetch-mode")
-        .and_then(|value| value.to_str().ok())
-    {
-        if mode.eq_ignore_ascii_case("navigate") {
-            return true;
-        }
-    }
-
-    if let Some(dest) = headers
-        .get("sec-fetch-dest")
-        .and_then(|value| value.to_str().ok())
-    {
-        return matches!(
-            dest.to_ascii_lowercase().as_str(),
-            "document" | "iframe" | "frame"
-        );
-    }
-
-    false
-}
-
-fn upstream_from_bare_token(uri: &axum::http::Uri) -> Option<Url> {
-    let path = uri.path().trim_start_matches('/');
-    if path.is_empty() || path.contains('/') {
-        return None;
-    }
-    decode_target(path).ok()
-}
-
-fn absolutize_relative_target(upstream_context: &Url, uri: &axum::http::Uri) -> Result<Url, url::ParseError> {
-    let mut origin = upstream_context.clone();
-    origin.set_path("/");
-    origin.set_query(None);
-    origin.set_fragment(None);
-    let path_q = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
-    origin.join(path_q)
-}
-
-fn method_from_axum(method: &Method) -> reqwest::Method {
-    reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap_or(reqwest::Method::GET)
 }
 
 fn filtered_request_headers(
     input: &HeaderMap,
-    target_upstream: &Url,
-    proxy_origin: &Url,
-    is_googlevideo: bool,
-) -> reqwest::header::HeaderMap {
+    upstream: &Url,
+    sid: &str,
+    cookies: &Arc<Mutex<CookieStore>>,
+) -> Result<reqwest::header::HeaderMap, ProxyError> {
     let mut out = reqwest::header::HeaderMap::new();
-    let context_upstream = upstream_from_context(input);
-    let referer_base = context_upstream.as_ref().unwrap_or(target_upstream);
-    let rewritten_referer = input
-        .get(header::REFERER)
-        .and_then(|v| rewrite_referer_for_upstream(v, referer_base, proxy_origin));
 
-    for (name, value) in input.iter() {
+    for (name, value) in input {
         if is_hop_by_hop(name)
             || name == header::HOST
+            || name == header::COOKIE
             || name == header::CONTENT_LENGTH
-            || name.as_str().eq_ignore_ascii_case("x-webrascal-upstream")
+            || name.as_str().eq_ignore_ascii_case("x-wr-session")
         {
             continue;
         }
 
-        if name == header::COOKIE {
-            if let Some(cookie) = sanitize_cookie_header(value) {
-                out.insert(reqwest::header::COOKIE, cookie);
-            }
-            continue;
-        }
-
         if name == header::ORIGIN {
-            if let Some(mut origin) = rewrite_origin_for_upstream(
-                value,
-                context_upstream.as_ref(),
-                rewritten_referer.as_ref(),
-                target_upstream,
-                proxy_origin,
-            ) {
-                if is_googlevideo {
-                    let gv_origin = googlevideo_origin(context_upstream.as_ref());
-                    if let Ok(v) = reqwest::header::HeaderValue::from_str(&gv_origin) {
-                        origin = v;
-                    }
-                }
-                out.insert(reqwest::header::ORIGIN, origin);
+            if let Ok(value) = reqwest::header::HeaderValue::from_str(&upstream.origin().ascii_serialization()) {
+                out.insert(reqwest::header::ORIGIN, value);
             }
             continue;
         }
 
         if name == header::REFERER {
-            if let Some(mut referrer) = rewritten_referer.clone() {
-                if is_googlevideo {
-                    let gv_referrer = googlevideo_referer(context_upstream.as_ref());
-                    if let Ok(v) = reqwest::header::HeaderValue::from_str(&gv_referrer) {
-                        referrer = v;
-                    }
-                }
-                out.insert(reqwest::header::REFERER, referrer);
+            if let Ok(value) = reqwest::header::HeaderValue::from_str(upstream.as_str()) {
+                out.insert(reqwest::header::REFERER, value);
             }
             continue;
         }
@@ -469,195 +229,164 @@ fn filtered_request_headers(
             out.insert(parsed_name, parsed_value);
         }
     }
-    out
-}
 
-fn googlevideo_origin(context_upstream: Option<&Url>) -> String {
-    if let Some(ctx) = context_upstream {
-        if ctx.host_str().map(|h| h.ends_with("youtube.com")).unwrap_or(false) {
-            return ctx.origin().ascii_serialization();
+    if let Some(cookie_header) = build_cookie_header(cookies, sid, upstream) {
+        if let Ok(value) = reqwest::header::HeaderValue::from_str(&cookie_header) {
+            out.insert(reqwest::header::COOKIE, value);
         }
     }
-    "https://www.youtube.com".to_string()
+
+    Ok(out)
 }
 
-fn googlevideo_referer(context_upstream: Option<&Url>) -> String {
-    if let Some(ctx) = context_upstream {
-        if ctx.host_str().map(|h| h.ends_with("youtube.com")).unwrap_or(false) {
-            let mut base = ctx.clone();
-            base.set_fragment(None);
-            return base.to_string();
-        }
-    }
-    "https://www.youtube.com/".to_string()
-}
+fn build_cookie_header(cookies: &Arc<Mutex<CookieStore>>, sid: &str, upstream: &Url) -> Option<String> {
+    let host = upstream.host_str()?.to_ascii_lowercase();
+    let mut merged: HashMap<String, String> = HashMap::new();
 
-fn sanitize_cookie_header(value: &HeaderValue) -> Option<reqwest::header::HeaderValue> {
-    let raw = value.to_str().ok()?;
-    let mut kept = Vec::new();
-    for part in raw.split(';') {
-        let trimmed = part.trim();
-        if trimmed.is_empty() || trimmed.starts_with("wr_ctx=") {
-            continue;
+    let store = cookies.lock().ok()?;
+    let session = store.sessions.get(sid)?;
+    for (domain, jar) in &session.domains {
+        if domain_matches(&host, domain) {
+            for (name, value) in jar {
+                merged.insert(name.clone(), value.clone());
+            }
         }
-        kept.push(trimmed);
     }
-    if kept.is_empty() {
+
+    if merged.is_empty() {
         return None;
     }
-    reqwest::header::HeaderValue::from_str(&kept.join("; ")).ok()
+
+    let mut parts = Vec::with_capacity(merged.len());
+    for (name, value) in merged {
+        parts.push(format!("{name}={value}"));
+    }
+    Some(parts.join("; "))
 }
 
-fn rewrite_referer_for_upstream(
-    value: &HeaderValue,
-    context_upstream: &Url,
-    proxy_origin: &Url,
-) -> Option<reqwest::header::HeaderValue> {
-    let raw = value.to_str().ok()?;
-    let parsed = Url::parse(raw).ok();
-
-    let rewritten = if let Some(ref_url) = parsed {
-        if same_origin(&ref_url, proxy_origin) {
-            if let Some(token) = ref_url.path().strip_prefix("/proxy/") {
-                decode_target(token).ok().map(|u| u.to_string()).unwrap_or_else(|| raw.to_string())
-            } else {
-                let mut mapped = context_upstream.clone();
-                mapped.set_path(ref_url.path());
-                mapped.set_query(ref_url.query());
-                mapped.set_fragment(ref_url.fragment());
-                mapped.to_string()
-            }
-        } else {
-            raw.to_string()
-        }
-    } else {
-        raw.to_string()
-    };
-
-    reqwest::header::HeaderValue::from_str(&rewritten).ok()
+fn domain_matches(host: &str, domain: &str) -> bool {
+    host == domain || host.ends_with(&format!(".{domain}"))
 }
 
-fn rewrite_origin_for_upstream(
-    value: &HeaderValue,
-    context_upstream: Option<&Url>,
-    rewritten_referer: Option<&reqwest::header::HeaderValue>,
-    target_upstream: &Url,
-    proxy_origin: &Url,
-) -> Option<reqwest::header::HeaderValue> {
-    let raw = value.to_str().ok()?;
-    let parsed_origin = Url::parse(raw).ok();
+fn store_set_cookies(cookies: &Arc<Mutex<CookieStore>>, sid: &str, upstream: &Url, headers: &reqwest::header::HeaderMap) {
+    let default_domain = upstream
+        .host_str()
+        .map(|h| h.to_ascii_lowercase())
+        .unwrap_or_default();
 
-    if let Some(origin_url) = parsed_origin {
-        if same_origin(&origin_url, proxy_origin) {
-            if let Some(referrer_value) = rewritten_referer {
-                if let Ok(referrer_str) = referrer_value.to_str() {
-                    if let Ok(referrer_url) = Url::parse(referrer_str) {
-                        let origin = referrer_url.origin().ascii_serialization();
-                        return reqwest::header::HeaderValue::from_str(&origin).ok();
-                    }
-                }
+    let mut parsed = Vec::new();
+    for value in headers.get_all(reqwest::header::SET_COOKIE) {
+        if let Ok(raw) = value.to_str() {
+            if let Some(cookie) = parse_set_cookie(raw, &default_domain) {
+                parsed.push(cookie);
             }
-            let fallback = context_upstream.unwrap_or(target_upstream);
-            let origin = fallback.origin().ascii_serialization();
-            return reqwest::header::HeaderValue::from_str(&origin).ok();
         }
     }
 
-    reqwest::header::HeaderValue::from_bytes(value.as_bytes()).ok()
+    if parsed.is_empty() {
+        return;
+    }
+
+    if let Ok(mut store) = cookies.lock() {
+        let session = store
+            .sessions
+            .entry(sid.to_string())
+            .or_insert_with(SessionCookies::default);
+        for cookie in parsed {
+            let jar = session
+                .domains
+                .entry(cookie.domain)
+                .or_insert_with(HashMap::new);
+            if cookie.delete {
+                jar.remove(&cookie.name);
+            } else {
+                jar.insert(cookie.name, cookie.value);
+            }
+        }
+    }
 }
 
-fn same_origin(a: &Url, b: &Url) -> bool {
-    a.scheme() == b.scheme()
-        && a.host_str() == b.host_str()
-        && a.port_or_known_default() == b.port_or_known_default()
+fn parse_set_cookie(raw: &str, default_domain: &str) -> Option<ParsedSetCookie> {
+    let mut parts = raw.split(';');
+    let first = parts.next()?.trim();
+    let mut kv = first.splitn(2, '=');
+    let name = kv.next()?.trim().to_string();
+    let value = kv.next().unwrap_or("").trim().to_string();
+    if name.is_empty() {
+        return None;
+    }
+
+    let mut domain = default_domain.to_string();
+    let mut delete = false;
+
+    for attr in parts {
+        let trimmed = attr.trim();
+        let mut attr_kv = trimmed.splitn(2, '=');
+        let key = attr_kv.next().unwrap_or("").trim().to_ascii_lowercase();
+        let val = attr_kv.next().unwrap_or("").trim();
+        if key == "domain" && !val.is_empty() {
+            domain = val.trim_start_matches('.').to_ascii_lowercase();
+        }
+        if key == "max-age" && val == "0" {
+            delete = true;
+        }
+        if key == "expires" && val.contains("1970") {
+            delete = true;
+        }
+    }
+
+    Some(ParsedSetCookie {
+        domain,
+        name,
+        value,
+        delete,
+    })
 }
 
 fn filtered_response_headers(input: &reqwest::header::HeaderMap) -> HeaderMap {
     let mut out = HeaderMap::new();
-    for (name, value) in input.iter() {
-        if is_hop_by_hop(name) || name == reqwest::header::CONTENT_LENGTH || is_strict_security_response_header(name) {
+    for (name, value) in input {
+        if is_hop_by_hop(name)
+            || name == reqwest::header::CONTENT_LENGTH
+            || name == reqwest::header::SET_COOKIE
+        {
             continue;
         }
+
         if let (Ok(parsed_name), Ok(parsed_value)) = (
             HeaderName::from_bytes(name.as_str().as_bytes()),
             HeaderValue::from_bytes(value.as_bytes()),
         ) {
-            if parsed_name == header::SET_COOKIE {
-                out.append(parsed_name, parsed_value);
-            } else {
-                out.insert(parsed_name, parsed_value);
-            }
+            out.insert(parsed_name, parsed_value);
         }
     }
     out
 }
 
-fn is_strict_security_response_header(name: &reqwest::header::HeaderName) -> bool {
-    matches!(
-        name.as_str().to_ascii_lowercase().as_str(),
-        "x-frame-options"
-            | "content-security-policy"
-            | "content-security-policy-report-only"
-            | "referrer-policy"
-            | "cross-origin-opener-policy"
-            | "cross-origin-embedder-policy"
-            | "cross-origin-resource-policy"
-    )
-}
-
-fn apply_proxy_context_headers(headers: &mut HeaderMap, upstream: &Url) {
-    let token = encode_target(upstream);
-    let cookie = format!("wr_ctx={token}; Path=/; HttpOnly; SameSite=Lax");
-    if let Ok(value) = HeaderValue::from_str(&cookie) {
-        headers.append(header::SET_COOKIE, value);
-    }
-
-    if !headers.contains_key(header::REFERRER_POLICY) {
-        headers.insert(
-            header::REFERRER_POLICY,
-            HeaderValue::from_static("strict-origin-when-cross-origin"),
-        );
-    }
-}
-
-fn should_apply_proxy_context(status: StatusCode, request_headers: &HeaderMap) -> bool {
-    if !status.is_success() {
-        return false;
-    }
-
-    if let Some(dest) = request_headers
-        .get("sec-fetch-dest")
-        .and_then(|value| value.to_str().ok())
-    {
-        let lower = dest.to_ascii_lowercase();
-        if lower == "document" {
-            return true;
-        }
-        if lower == "iframe" || lower == "frame" {
-            return is_root_embed_request(request_headers);
-        }
-        return false;
-    }
-
-    request_headers
-        .get(header::ACCEPT)
-        .and_then(|value| value.to_str().ok())
-        .map(|accept| accept.contains("text/html"))
-        .unwrap_or(false)
-}
-
-fn is_root_embed_request(request_headers: &HeaderMap) -> bool {
-    let Some(raw) = request_headers
-        .get(header::REFERER)
-        .and_then(|value| value.to_str().ok())
-    else {
-        return true;
+fn rewrite_location_header(headers: &mut HeaderMap, upstream: &Url, sid: &str) {
+    let Some(location) = headers.get(header::LOCATION).cloned() else {
+        return;
     };
-    let Ok(url) = Url::parse(raw) else {
-        return true;
+
+    let Ok(location_str) = location.to_str() else {
+        return;
     };
-    let path = url.path();
-    path == "/" || path == "/index.html"
+
+    let target = Url::parse(location_str)
+        .or_else(|_| upstream.join(location_str))
+        .ok();
+    let Some(target) = target else {
+        return;
+    };
+
+    let rewritten = format!("/proxy/{}?sid={sid}", encode_target(&target));
+    if let Ok(value) = HeaderValue::from_str(&rewritten) {
+        headers.insert(header::LOCATION, value);
+    }
+}
+
+fn method_from_axum(method: &Method) -> reqwest::Method {
+    reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap_or(reqwest::Method::GET)
 }
 
 fn is_hop_by_hop(name: &HeaderName) -> bool {
@@ -688,15 +417,6 @@ fn describe_reqwest_error(stage: &str, method: &Method, upstream: &Url, err: &re
     if err.is_decode() {
         flags.push("decode");
     }
-    if err.is_redirect() {
-        flags.push("redirect");
-    }
-    if err.is_builder() {
-        flags.push("builder");
-    }
-    if err.is_body() {
-        flags.push("body");
-    }
 
     let mut message = format!("{stage} failed for {} {}: {err}", method, upstream);
     if !flags.is_empty() {
@@ -710,12 +430,6 @@ fn describe_reqwest_error(stage: &str, method: &Method, upstream: &Url, err: &re
         message.push_str(" | cause: ");
         message.push_str(&cause.to_string());
         source = cause.source();
-    }
-
-    if message.contains("UnknownIssuer") {
-        message.push_str(
-            " | hint: untrusted TLS issuer. Use system root certs, trust your network's root CA, or use --insecure for local debugging only.",
-        );
     }
 
     message
