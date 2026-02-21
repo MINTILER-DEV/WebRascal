@@ -51,11 +51,7 @@ pub fn rewrite_html(html: &str, upstream: &Url, proxy_origin: &Url) -> String {
                     .to_string();
             };
 
-            let rewritten = if joined.origin() == upstream.origin() {
-                local_proxy_path(&joined)
-            } else {
-                proxy_url(proxy_origin, &joined)
-            };
+            let rewritten = proxy_url(proxy_origin, &joined);
             format!(r#"{attr}="{rewritten}""#)
         })
         .to_string();
@@ -78,11 +74,7 @@ pub fn rewrite_location_header(headers: &mut HeaderMap, upstream: &Url, proxy_or
         return;
     };
 
-    let rewritten = if target.origin() == upstream.origin() {
-        local_proxy_path(&target)
-    } else {
-        proxy_url(proxy_origin, &target)
-    };
+    let rewritten = proxy_url(proxy_origin, &target);
     if let Ok(value) = rewritten.parse() {
         headers.insert("location", value);
     }
@@ -90,19 +82,6 @@ pub fn rewrite_location_header(headers: &mut HeaderMap, upstream: &Url, proxy_or
 
 pub fn proxy_url(proxy_origin: &Url, target: &Url) -> String {
     format!("{}/proxy/{}", proxy_origin.as_str().trim_end_matches('/'), encode_target(target))
-}
-
-fn local_proxy_path(target: &Url) -> String {
-    let mut out = target.path().to_string();
-    if let Some(query) = target.query() {
-        out.push('?');
-        out.push_str(query);
-    }
-    if let Some(fragment) = target.fragment() {
-        out.push('#');
-        out.push_str(fragment);
-    }
-    out
 }
 
 fn should_skip_rewrite(raw: &str) -> bool {
@@ -171,6 +150,30 @@ fn runtime_shim_script(upstream: &Url, proxy_origin: &Url) -> String {
     }}
     return String(input);
   }};
+  const decodeProxyToken = (token) => {{
+    const normalized = token.replaceAll("-", "+").replaceAll("_", "/");
+    const pad = normalized.length % 4 === 0 ? "" : "=".repeat(4 - (normalized.length % 4));
+    const binary = atob(normalized + pad);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return new TextDecoder().decode(bytes);
+  }};
+  const resolveUrl = (input) => {{
+    try {{
+      const raw = toRaw(input);
+      if (!raw || skip.test(raw)) return null;
+      const resolved = new URL(raw, upstreamBase);
+      if (resolved.origin === proxyOrigin && resolved.pathname.startsWith("/proxy/")) {{
+        const token = resolved.pathname.slice("/proxy/".length);
+        if (!token) return resolved;
+        const decoded = decodeProxyToken(token);
+        return new URL(decoded, upstreamBase);
+      }}
+      return resolved;
+    }} catch (_) {{
+      return null;
+    }}
+  }};
   const b64url = (input) => {{
     const bytes = new TextEncoder().encode(input);
     let binary = "";
@@ -179,29 +182,20 @@ fn runtime_shim_script(upstream: &Url, proxy_origin: &Url) -> String {
   }};
   const toProxy = (input) => {{
     try {{
-      const raw = toRaw(input);
-      if (!raw || skip.test(raw)) return null;
-      const resolved = new URL(raw, upstreamBase);
-      if (resolved.origin === upstreamBase.origin) {{
-        return resolved.pathname + resolved.search + resolved.hash;
+      const resolved = resolveUrl(input);
+      if (!resolved) return null;
+      if (resolved.origin === proxyOrigin && resolved.pathname.startsWith("/proxy/")) {{
+        return resolved.toString();
       }}
-      if (resolved.origin === proxyOrigin) {{
-        if (resolved.pathname.startsWith("/proxy/")) return resolved.toString();
-        const mapped = new URL(resolved.pathname + resolved.search + resolved.hash, upstreamBase.origin);
-        return proxyPrefix + b64url(mapped.toString());
-      }}
-      const abs = resolved.toString();
-      if (abs.startsWith(proxyPrefix)) return abs;
-      return proxyPrefix + b64url(abs);
+      return proxyPrefix + b64url(resolved.toString());
     }} catch (_) {{
       return null;
     }}
   }};
   const toAppPath = (input) => {{
     try {{
-      const raw = toRaw(input);
-      if (!raw || skip.test(raw)) return null;
-      const resolved = new URL(raw, upstreamBase);
+      const resolved = resolveUrl(input);
+      if (!resolved) return null;
       if (resolved.origin !== upstreamBase.origin) return null;
       return resolved.pathname + resolved.search + resolved.hash;
     }} catch (_) {{
@@ -392,7 +386,7 @@ fn runtime_shim_script(upstream: &Url, proxy_origin: &Url) -> String {
       const form = event.target;
       if (!(form instanceof HTMLFormElement)) return;
       const action = form.getAttribute("action") || window.location.href;
-      const proxied = toProxy(action);
+      const proxied = toNavigable(action);
       if (proxied) form.setAttribute("action", proxied);
     }} catch (_) {{}}
   }}, true);
@@ -402,7 +396,7 @@ fn runtime_shim_script(upstream: &Url, proxy_origin: &Url) -> String {
       const link = target && target.closest ? target.closest("a[href]") : null;
       if (!link) return;
       const raw = link.getAttribute("href") || link.href;
-      const proxied = toProxy(raw);
+      const proxied = toNavigable(raw);
       if (proxied) link.setAttribute("href", proxied);
     }} catch (_) {{}}
   }}, true);
@@ -440,7 +434,7 @@ mod tests {
         let out = rewrite_html(input, &upstream, &proxy);
 
         assert!(out.contains("http://127.0.0.1:8080/proxy/"));
-        assert!(out.contains("href=\"/next\""));
+        assert!(!out.contains("href=\"/next\""));
     }
 
     #[test]
@@ -452,6 +446,8 @@ mod tests {
         assert!(out.contains("window.fetch = function"));
         assert!(out.contains("document.addEventListener(\"submit\""));
         assert!(out.contains("window.history.pushState"));
+        assert!(out.contains("const resolveUrl = (input) =>"));
+        assert!(out.contains("const decodeProxyToken = (token) =>"));
         assert!(out.contains("const toRaw = (input) =>"));
         assert!(out.contains("window.history.go = function(delta)"));
         assert!(out.contains("const softNavigate = (input, mode) =>"));
