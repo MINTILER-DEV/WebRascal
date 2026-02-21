@@ -241,10 +241,12 @@ fn runtime_shim_script(upstream: &Url, proxy_origin: &Url) -> String {
   const patchLocationSetter = (owner, prop, mode) => {{
     try {{
       if (!owner) return;
-      const desc = Object.getOwnPropertyDescriptor(owner, prop);
-      if (!desc || typeof desc.set !== "function" || !desc.configurable) return;
+      const found = findSetter(owner, prop);
+      if (!found) return;
+      const {{ target, desc }} = found;
+      if (typeof desc.set !== "function" || !desc.configurable) return;
       const origSet = desc.set;
-      Object.defineProperty(owner, prop, Object.assign({{}}, desc, {{
+      Object.defineProperty(target, prop, Object.assign({{}}, desc, {{
         set(value) {{
           if (softNavigate(value, mode)) return;
           const nextUrl = toNavigable(value);
@@ -253,13 +255,24 @@ fn runtime_shim_script(upstream: &Url, proxy_origin: &Url) -> String {
       }}));
     }} catch (_) {{}}
   }};
+  const findSetter = (proto, prop) => {{
+    let cursor = proto;
+    while (cursor) {{
+      const desc = Object.getOwnPropertyDescriptor(cursor, prop);
+      if (desc) return {{ target: cursor, desc }};
+      cursor = Object.getPrototypeOf(cursor);
+    }}
+    return null;
+  }};
   const patchResourceSetter = (proto, prop, mapper) => {{
     try {{
       if (!proto) return;
-      const desc = Object.getOwnPropertyDescriptor(proto, prop);
-      if (!desc || typeof desc.set !== "function" || !desc.configurable) return;
+      const found = findSetter(proto, prop);
+      if (!found) return;
+      const {{ target, desc }} = found;
+      if (typeof desc.set !== "function" || !desc.configurable) return;
       const origSet = desc.set;
-      Object.defineProperty(proto, prop, Object.assign({{}}, desc, {{
+      Object.defineProperty(target, prop, Object.assign({{}}, desc, {{
         set(value) {{
           const mapped = mapper(value);
           return origSet.call(this, mapped || value);
@@ -353,6 +366,31 @@ fn runtime_shim_script(upstream: &Url, proxy_origin: &Url) -> String {
           }};
         }}
       }}
+    }} catch (_) {{}}
+  }};
+  const patchImageConstructor = () => {{
+    try {{
+      if (typeof window.Image !== "function") return;
+      const NativeImage = window.Image;
+      window.Image = function(...args) {{
+        const img = new NativeImage(...args);
+        try {{
+          return new Proxy(img, {{
+            set(target, prop, value) {{
+              if (prop === "src") {{
+                const mapped = toProxy(value);
+                target[prop] = mapped || value;
+                return true;
+              }}
+              target[prop] = value;
+              return true;
+            }}
+          }});
+        }} catch (_) {{
+          return img;
+        }}
+      }};
+      window.Image.prototype = NativeImage.prototype;
     }} catch (_) {{}}
   }};
   const origFetch = window.fetch;
@@ -496,6 +534,7 @@ fn runtime_shim_script(upstream: &Url, proxy_origin: &Url) -> String {
   }} catch (_) {{}}
   patchAttributeSetters();
   patchFormSubmissions();
+  patchImageConstructor();
   try {{
     patchResourceSetter(typeof HTMLImageElement !== "undefined" ? HTMLImageElement.prototype : null, "src", toProxy);
     patchResourceSetter(typeof HTMLImageElement !== "undefined" ? HTMLImageElement.prototype : null, "srcset", mapSrcset);
@@ -576,6 +615,8 @@ mod tests {
         assert!(out.contains("window.fetch = function"));
         assert!(out.contains("const patchAttributeSetters = () =>"));
         assert!(out.contains("const patchFormSubmissions = () =>"));
+        assert!(out.contains("const patchImageConstructor = () =>"));
+        assert!(out.contains("const findSetter = (proto, prop) =>"));
         assert!(out.contains("Element.prototype.setAttribute = function(name, value)"));
         assert!(out.contains("document.addEventListener(\"submit\""));
         assert!(out.contains("window.history.pushState"));
@@ -588,6 +629,7 @@ mod tests {
         assert!(out.contains("const patchResourceSetter = (proto, prop, mapper) =>"));
         assert!(out.contains("patchLocationSetter(window, \"location\", \"push\")"));
         assert!(out.contains("patchResourceSetter(typeof HTMLImageElement"));
+        assert!(out.contains("patchImageConstructor();"));
         assert!(out.contains("patchResourceSetter(typeof HTMLAnchorElement"));
         assert!(out.contains("patchResourceSetter(typeof HTMLFormElement"));
         assert!(out.contains("locProto.reload = function()"));
