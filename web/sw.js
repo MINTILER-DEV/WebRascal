@@ -4,8 +4,15 @@ self.addEventListener("fetch", (event) => {
   const request = event.request;
   if (request.method !== "GET") return;
 
-  const url = new URL(request.url);
+  let url;
+  try {
+    url = new URL(request.url);
+  } catch (_) {
+    return;
+  }
   const selfOrigin = self.location.origin;
+
+  if (url.protocol !== "http:" && url.protocol !== "https:") return;
 
   // Skip proxy internals/static files.
   if (
@@ -26,7 +33,17 @@ self.addEventListener("fetch", (event) => {
 
   const token = base64Url(url.href);
   const proxied = `/proxy/${token}`;
-  event.respondWith(fetch(proxied).catch(() => fetch(request)));
+  event.respondWith((async () => {
+    try {
+      return await fetch(proxied);
+    } catch (_) {
+      try {
+        return await fetch(request);
+      } catch (_) {
+        return Response.error();
+      }
+    }
+  })());
 });
 
 function base64Url(input) {

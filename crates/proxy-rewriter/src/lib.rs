@@ -157,6 +157,16 @@ fn runtime_shim_script(upstream: &Url, proxy_origin: &Url) -> String {
       return null;
     }}
   }};
+  const toProxyPath = (input) => {{
+    const proxied = toProxy(input);
+    if (!proxied) return null;
+    try {{
+      const parsed = new URL(proxied, proxyOrigin);
+      return parsed.pathname + parsed.search + parsed.hash;
+    }} catch (_) {{
+      return proxied;
+    }}
+  }};
   const origFetch = window.fetch;
   window.fetch = function(input, init) {{
     let nextInit = init;
@@ -204,6 +214,63 @@ fn runtime_shim_script(upstream: &Url, proxy_origin: &Url) -> String {
       return origBeacon(proxied || url, data);
     }};
   }}
+  const origWindowOpen = window.open;
+  if (typeof origWindowOpen === "function") {{
+    window.open = function(url) {{
+      const proxied = toProxy(url);
+      return origWindowOpen.call(this, proxied || url, ...Array.prototype.slice.call(arguments, 1));
+    }};
+  }}
+  if (window.history && typeof window.history.pushState === "function") {{
+    const origPushState = window.history.pushState;
+    window.history.pushState = function(state, title, url) {{
+      const nextUrl = url == null ? url : (toProxyPath(String(url)) || url);
+      return origPushState.call(this, state, title, nextUrl);
+    }};
+  }}
+  if (window.history && typeof window.history.replaceState === "function") {{
+    const origReplaceState = window.history.replaceState;
+    window.history.replaceState = function(state, title, url) {{
+      const nextUrl = url == null ? url : (toProxyPath(String(url)) || url);
+      return origReplaceState.call(this, state, title, nextUrl);
+    }};
+  }}
+  try {{
+    const locProto = window.Location && window.Location.prototype;
+    if (locProto && typeof locProto.assign === "function") {{
+      const origAssign = locProto.assign;
+      locProto.assign = function(url) {{
+        const proxied = toProxy(url);
+        return origAssign.call(this, proxied || url);
+      }};
+    }}
+    if (locProto && typeof locProto.replace === "function") {{
+      const origReplace = locProto.replace;
+      locProto.replace = function(url) {{
+        const proxied = toProxy(url);
+        return origReplace.call(this, proxied || url);
+      }};
+    }}
+  }} catch (_) {{}}
+  document.addEventListener("submit", (event) => {{
+    try {{
+      const form = event.target;
+      if (!(form instanceof HTMLFormElement)) return;
+      const action = form.getAttribute("action") || window.location.href;
+      const proxied = toProxy(action);
+      if (proxied) form.setAttribute("action", proxied);
+    }} catch (_) {{}}
+  }}, true);
+  document.addEventListener("click", (event) => {{
+    try {{
+      const target = event.target;
+      const link = target && target.closest ? target.closest("a[href]") : null;
+      if (!link) return;
+      const raw = link.getAttribute("href") || link.href;
+      const proxied = toProxy(raw);
+      if (proxied) link.setAttribute("href", proxied);
+    }} catch (_) {{}}
+  }}, true);
 }})();
 </script>"#
     )
@@ -248,6 +315,8 @@ mod tests {
         let input = r#"<html><head></head><body>ok</body></html>"#;
         let out = rewrite_html(input, &upstream, &proxy);
         assert!(out.contains("window.fetch = function"));
+        assert!(out.contains("document.addEventListener(\"submit\""));
+        assert!(out.contains("window.history.pushState"));
         assert!(out.contains("</script></head>"));
     }
 }
