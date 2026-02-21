@@ -135,11 +135,17 @@ async fn dispatch_upstream(
     headers: HeaderMap,
     body_bytes: axum::body::Bytes,
 ) -> Result<Response<Body>, ProxyError> {
+    let is_googlevideo = upstream
+        .host_str()
+        .map(|h| h.ends_with("googlevideo.com"))
+        .unwrap_or(false);
+
     let mut outgoing = state.client.request(method_from_axum(&method), upstream.clone());
     outgoing = outgoing.headers(filtered_request_headers(
         &headers,
         &upstream,
         &state.public_origin,
+        is_googlevideo,
     ));
     if !body_bytes.is_empty() {
         outgoing = outgoing.body(body_bytes);
@@ -160,7 +166,6 @@ async fn dispatch_upstream(
     let status = upstream_res.status();
     let mut response_headers = filtered_response_headers(upstream_res.headers());
     rewrite_location_header(&mut response_headers, &upstream, &state.public_origin);
-    apply_proxy_context_headers(&mut response_headers, &upstream);
 
     let content_type = upstream_res
         .headers()
@@ -168,6 +173,9 @@ async fn dispatch_upstream(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
+    if content_type.contains("text/html") {
+        apply_proxy_context_headers(&mut response_headers, &upstream);
+    }
 
     let body = upstream_res
         .bytes()
@@ -248,6 +256,7 @@ fn filtered_request_headers(
     input: &HeaderMap,
     target_upstream: &Url,
     proxy_origin: &Url,
+    is_googlevideo: bool,
 ) -> reqwest::header::HeaderMap {
     let mut out = reqwest::header::HeaderMap::new();
     let context_upstream = upstream_from_context(input);
@@ -273,20 +282,32 @@ fn filtered_request_headers(
         }
 
         if name == header::ORIGIN {
-            if let Some(origin) = rewrite_origin_for_upstream(
+            if let Some(mut origin) = rewrite_origin_for_upstream(
                 value,
                 context_upstream.as_ref(),
                 rewritten_referer.as_ref(),
                 target_upstream,
                 proxy_origin,
             ) {
+                if is_googlevideo {
+                    let gv_origin = googlevideo_origin(context_upstream.as_ref());
+                    if let Ok(v) = reqwest::header::HeaderValue::from_str(&gv_origin) {
+                        origin = v;
+                    }
+                }
                 out.insert(reqwest::header::ORIGIN, origin);
             }
             continue;
         }
 
         if name == header::REFERER {
-            if let Some(referrer) = rewritten_referer.clone() {
+            if let Some(mut referrer) = rewritten_referer.clone() {
+                if is_googlevideo {
+                    let gv_referrer = googlevideo_referer(context_upstream.as_ref());
+                    if let Ok(v) = reqwest::header::HeaderValue::from_str(&gv_referrer) {
+                        referrer = v;
+                    }
+                }
                 out.insert(reqwest::header::REFERER, referrer);
             }
             continue;
@@ -300,6 +321,26 @@ fn filtered_request_headers(
         }
     }
     out
+}
+
+fn googlevideo_origin(context_upstream: Option<&Url>) -> String {
+    if let Some(ctx) = context_upstream {
+        if ctx.host_str().map(|h| h.ends_with("youtube.com")).unwrap_or(false) {
+            return ctx.origin().ascii_serialization();
+        }
+    }
+    "https://www.youtube.com".to_string()
+}
+
+fn googlevideo_referer(context_upstream: Option<&Url>) -> String {
+    if let Some(ctx) = context_upstream {
+        if ctx.host_str().map(|h| h.ends_with("youtube.com")).unwrap_or(false) {
+            let mut base = ctx.clone();
+            base.set_fragment(None);
+            return base.to_string();
+        }
+    }
+    "https://www.youtube.com/".to_string()
 }
 
 fn sanitize_cookie_header(value: &HeaderValue) -> Option<reqwest::header::HeaderValue> {
