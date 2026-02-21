@@ -9,10 +9,11 @@ use clap::Parser;
 use proxy_rewriter::{decode_target, encode_target, rewrite_html, rewrite_location_header};
 use reqwest::Client;
 use serde::Deserialize;
+use std::error::Error as StdError;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tower_http::services::ServeDir;
-use tracing::info;
+use tracing::{error, info};
 use url::Url;
 
 #[derive(Debug, Parser)]
@@ -21,6 +22,8 @@ struct Args {
     listen: SocketAddr,
     #[arg(long, default_value = "http://127.0.0.1:8080")]
     public_origin: Url,
+    #[arg(long, default_value_t = false)]
+    insecure: bool,
 }
 
 #[derive(Clone)]
@@ -41,8 +44,13 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let args = Args::parse();
-    let client = Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
+    let mut client_builder = Client::builder().redirect(reqwest::redirect::Policy::none());
+    if args.insecure {
+        info!("TLS certificate verification disabled via --insecure");
+        client_builder = client_builder.danger_accept_invalid_certs(true);
+    }
+
+    let client = client_builder
         .build()
         .context("failed building reqwest client")?;
 
@@ -53,6 +61,7 @@ async fn main() -> anyhow::Result<()> {
 
     let app = Router::new()
         .route("/", get(index))
+        .route("/sw.js", get(service_worker))
         .route("/healthz", get(healthz))
         .route("/api/encode", get(encode))
         .route("/proxy/:token", any(proxy))
@@ -71,6 +80,13 @@ async fn index() -> Html<&'static str> {
 
 async fn healthz() -> &'static str {
     "ok"
+}
+
+async fn service_worker() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "application/javascript; charset=utf-8")],
+        include_str!("../../../web/sw.js"),
+    )
 }
 
 async fn encode(Query(query): Query<EncodeQuery>) -> Result<Json<serde_json::Value>, ProxyError> {
@@ -101,7 +117,11 @@ async fn proxy(
     let upstream_res = outgoing
         .send()
         .await
-        .map_err(|e| ProxyError::Upstream(format!("request failed: {e}")))?;
+        .map_err(|e| {
+            let detail = describe_reqwest_error("send", &method, &upstream, &e);
+            error!("{detail}");
+            ProxyError::Upstream(detail)
+        })?;
 
     let status = upstream_res.status();
     let mut response_headers = filtered_response_headers(upstream_res.headers());
@@ -117,7 +137,11 @@ async fn proxy(
     let body = upstream_res
         .bytes()
         .await
-        .map_err(|e| ProxyError::Upstream(format!("failed reading upstream body: {e}")))?;
+        .map_err(|e| {
+            let detail = format!("failed reading upstream body: {e}");
+            error!("{detail}");
+            ProxyError::Upstream(detail)
+        })?;
 
     if content_type.contains("text/html") {
         let html = String::from_utf8_lossy(&body);
@@ -182,6 +206,53 @@ fn is_hop_by_hop(name: &HeaderName) -> bool {
             | "transfer-encoding"
             | "upgrade"
     )
+}
+
+fn describe_reqwest_error(stage: &str, method: &Method, upstream: &Url, err: &reqwest::Error) -> String {
+    let mut flags = Vec::new();
+    if err.is_connect() {
+        flags.push("connect");
+    }
+    if err.is_timeout() {
+        flags.push("timeout");
+    }
+    if err.is_request() {
+        flags.push("request");
+    }
+    if err.is_decode() {
+        flags.push("decode");
+    }
+    if err.is_redirect() {
+        flags.push("redirect");
+    }
+    if err.is_builder() {
+        flags.push("builder");
+    }
+    if err.is_body() {
+        flags.push("body");
+    }
+
+    let mut message = format!("{stage} failed for {} {}: {err}", method, upstream);
+    if !flags.is_empty() {
+        message.push_str(" [kind=");
+        message.push_str(&flags.join("|"));
+        message.push(']');
+    }
+
+    let mut source = err.source();
+    while let Some(cause) = source {
+        message.push_str(" | cause: ");
+        message.push_str(&cause.to_string());
+        source = cause.source();
+    }
+
+    if message.contains("UnknownIssuer") {
+        message.push_str(
+            " | hint: untrusted TLS issuer. Use system root certs, trust your network's root CA, or use --insecure for local debugging only.",
+        );
+    }
+
+    message
 }
 
 #[derive(Debug)]

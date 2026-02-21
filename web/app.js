@@ -28,7 +28,7 @@ swButton.addEventListener("click", async () => {
     return;
   }
   try {
-    await navigator.serviceWorker.register("/web/sw.js", { scope: "/" });
+    await navigator.serviceWorker.register("/sw.js", { scope: "/" });
     status("Service worker registered.");
   } catch (error) {
     status("Service worker registration failed: " + String(error));
