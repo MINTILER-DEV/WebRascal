@@ -155,6 +155,22 @@ fn runtime_shim_script(upstream: &Url, proxy_origin: &Url) -> String {
   const upstreamContext = upstreamBase.toString();
   const contextHeader = "x-webrascal-upstream";
   const skip = /^(data:|blob:|javascript:|about:|mailto:)/i;
+  const toRaw = (input) => {{
+    if (input == null) return "";
+    if (typeof input === "string") return input;
+    if (typeof URL !== "undefined" && input instanceof URL) return input.href;
+    if (typeof Request !== "undefined" && input instanceof Request) return input.url || "";
+    if (typeof input === "object") {{
+      if (typeof input.url === "string") return input.url;
+      if (typeof input.href === "string") return input.href;
+      try {{
+        return String(input);
+      }} catch (_) {{
+        return "";
+      }}
+    }}
+    return String(input);
+  }};
   const b64url = (input) => {{
     const bytes = new TextEncoder().encode(input);
     let binary = "";
@@ -163,7 +179,7 @@ fn runtime_shim_script(upstream: &Url, proxy_origin: &Url) -> String {
   }};
   const toProxy = (input) => {{
     try {{
-      const raw = typeof input === "string" ? input : (input && input.url) ? input.url : "";
+      const raw = toRaw(input);
       if (!raw || skip.test(raw)) return null;
       const resolved = new URL(raw, upstreamBase);
       if (resolved.origin === upstreamBase.origin) {{
@@ -183,7 +199,7 @@ fn runtime_shim_script(upstream: &Url, proxy_origin: &Url) -> String {
   }};
   const toAppPath = (input) => {{
     try {{
-      const raw = typeof input === "string" ? input : (input && input.url) ? input.url : "";
+      const raw = toRaw(input);
       if (!raw || skip.test(raw)) return null;
       const resolved = new URL(raw, upstreamBase);
       if (resolved.origin !== upstreamBase.origin) return null;
@@ -298,6 +314,18 @@ fn runtime_shim_script(upstream: &Url, proxy_origin: &Url) -> String {
     window.history.replaceState = function(state, title, url) {{
       const nextUrl = url == null ? url : (toAppPath(String(url)) || url);
       return origReplaceState.call(this, state, title, nextUrl);
+    }};
+  }}
+  if (window.history && typeof window.history.go === "function") {{
+    const origGo = window.history.go;
+    window.history.go = function(delta) {{
+      if (delta === 0) {{
+        try {{
+          window.dispatchEvent(new PopStateEvent("popstate", {{ state: window.history.state }}));
+          return;
+        }} catch (_) {{}}
+      }}
+      return origGo.call(this, delta);
     }};
   }}
   try {{
@@ -424,6 +452,8 @@ mod tests {
         assert!(out.contains("window.fetch = function"));
         assert!(out.contains("document.addEventListener(\"submit\""));
         assert!(out.contains("window.history.pushState"));
+        assert!(out.contains("const toRaw = (input) =>"));
+        assert!(out.contains("window.history.go = function(delta)"));
         assert!(out.contains("const softNavigate = (input, mode) =>"));
         assert!(out.contains("const patchLocationSetter = (owner, prop, mode) =>"));
         assert!(out.contains("patchLocationSetter(window, \"location\", \"push\")"));
