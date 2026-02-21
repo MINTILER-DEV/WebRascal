@@ -242,6 +242,20 @@ fn runtime_shim_script(upstream: &Url, proxy_origin: &Url) -> String {
       }}));
     }} catch (_) {{}}
   }};
+  const patchResourceSetter = (proto, prop, mapper) => {{
+    try {{
+      if (!proto) return;
+      const desc = Object.getOwnPropertyDescriptor(proto, prop);
+      if (!desc || typeof desc.set !== "function" || !desc.configurable) return;
+      const origSet = desc.set;
+      Object.defineProperty(proto, prop, Object.assign({{}}, desc, {{
+        set(value) {{
+          const mapped = mapper(value);
+          return origSet.call(this, mapped || value);
+        }}
+      }}));
+    }} catch (_) {{}}
+  }};
   const origFetch = window.fetch;
   window.fetch = function(input, init) {{
     let nextInit = init;
@@ -381,6 +395,14 @@ fn runtime_shim_script(upstream: &Url, proxy_origin: &Url) -> String {
     patchLocationSetter(winProto, "location", "push");
     patchLocationSetter(Document.prototype, "location", "push");
   }} catch (_) {{}}
+  try {{
+    patchResourceSetter(typeof HTMLImageElement !== "undefined" ? HTMLImageElement.prototype : null, "src", toProxy);
+    patchResourceSetter(typeof HTMLScriptElement !== "undefined" ? HTMLScriptElement.prototype : null, "src", toProxy);
+    patchResourceSetter(typeof HTMLIFrameElement !== "undefined" ? HTMLIFrameElement.prototype : null, "src", toProxy);
+    patchResourceSetter(typeof HTMLMediaElement !== "undefined" ? HTMLMediaElement.prototype : null, "src", toProxy);
+    patchResourceSetter(typeof HTMLSourceElement !== "undefined" ? HTMLSourceElement.prototype : null, "src", toProxy);
+    patchResourceSetter(typeof HTMLLinkElement !== "undefined" ? HTMLLinkElement.prototype : null, "href", toProxy);
+  }} catch (_) {{}}
   document.addEventListener("submit", (event) => {{
     try {{
       const form = event.target;
@@ -452,7 +474,9 @@ mod tests {
         assert!(out.contains("window.history.go = function(delta)"));
         assert!(out.contains("const softNavigate = (input, mode) =>"));
         assert!(out.contains("const patchLocationSetter = (owner, prop, mode) =>"));
+        assert!(out.contains("const patchResourceSetter = (proto, prop, mapper) =>"));
         assert!(out.contains("patchLocationSetter(window, \"location\", \"push\")"));
+        assert!(out.contains("patchResourceSetter(typeof HTMLImageElement"));
         assert!(out.contains("locProto.reload = function()"));
         assert!(out.contains("window.dispatchEvent(new PopStateEvent(\"popstate\""));
         assert!(out.contains("</script></head>"));

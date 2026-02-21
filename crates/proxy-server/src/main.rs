@@ -185,6 +185,7 @@ async fn dispatch_upstream(
         outgoing = outgoing.body(body_bytes);
     } else if method == Method::POST || method == Method::PUT || method == Method::PATCH {
         // Some upstreams require explicit content-length for empty entity requests.
+        outgoing = outgoing.header(reqwest::header::CONTENT_LENGTH, "0");
         outgoing = outgoing.body(Vec::new());
     }
 
