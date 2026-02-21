@@ -193,6 +193,21 @@ fn runtime_shim_script(upstream: &Url, proxy_origin: &Url) -> String {
       return false;
     }}
   }};
+  const patchLocationSetter = (owner, prop, mode) => {{
+    try {{
+      if (!owner) return;
+      const desc = Object.getOwnPropertyDescriptor(owner, prop);
+      if (!desc || typeof desc.set !== "function" || !desc.configurable) return;
+      const origSet = desc.set;
+      Object.defineProperty(owner, prop, Object.assign({{}}, desc, {{
+        set(value) {{
+          if (softNavigate(value, mode)) return;
+          const nextUrl = toNavigable(value);
+          return origSet.call(this, nextUrl || value);
+        }}
+      }}));
+    }} catch (_) {{}}
+  }};
   const origFetch = window.fetch;
   window.fetch = function(input, init) {{
     let nextInit = init;
@@ -304,6 +319,12 @@ fn runtime_shim_script(upstream: &Url, proxy_origin: &Url) -> String {
       }}
     }}
   }} catch (_) {{}}
+  try {{
+    patchLocationSetter(window, "location", "push");
+    const winProto = Object.getPrototypeOf(window);
+    patchLocationSetter(winProto, "location", "push");
+    patchLocationSetter(Document.prototype, "location", "push");
+  }} catch (_) {{}}
   document.addEventListener("submit", (event) => {{
     try {{
       const form = event.target;
@@ -370,6 +391,8 @@ mod tests {
         assert!(out.contains("document.addEventListener(\"submit\""));
         assert!(out.contains("window.history.pushState"));
         assert!(out.contains("const softNavigate = (input, mode) =>"));
+        assert!(out.contains("const patchLocationSetter = (owner, prop, mode) =>"));
+        assert!(out.contains("patchLocationSetter(window, \"location\", \"push\")"));
         assert!(out.contains("window.dispatchEvent(new PopStateEvent(\"popstate\""));
         assert!(out.contains("</script></head>"));
     }
