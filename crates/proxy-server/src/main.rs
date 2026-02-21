@@ -143,6 +143,9 @@ async fn dispatch_upstream(
     ));
     if !body_bytes.is_empty() {
         outgoing = outgoing.body(body_bytes);
+    } else if method == Method::POST || method == Method::PUT || method == Method::PATCH {
+        // Some upstreams require explicit content-length for empty entity requests.
+        outgoing = outgoing.body(Vec::new());
     }
 
     let upstream_res = outgoing
@@ -203,6 +206,10 @@ fn upstream_from_referer(headers: &HeaderMap) -> Option<Url> {
 }
 
 fn upstream_from_context(headers: &HeaderMap) -> Option<Url> {
+    if let Some(url) = upstream_from_header(headers) {
+        return Some(url);
+    }
+
     if let Some(url) = upstream_from_referer(headers) {
         return Some(url);
     }
@@ -217,6 +224,11 @@ fn upstream_from_context(headers: &HeaderMap) -> Option<Url> {
         }
     }
     None
+}
+
+fn upstream_from_header(headers: &HeaderMap) -> Option<Url> {
+    let value = headers.get("x-webrascal-upstream")?.to_str().ok()?;
+    Url::parse(value).ok()
 }
 
 fn absolutize_relative_target(upstream_context: &Url, uri: &axum::http::Uri) -> Result<Url, url::ParseError> {

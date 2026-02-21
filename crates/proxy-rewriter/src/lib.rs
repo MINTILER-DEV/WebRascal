@@ -131,6 +131,8 @@ fn runtime_shim_script(upstream: &Url, proxy_origin: &Url) -> String {
   const upstreamBase = new URL("{upstream_js}");
   const proxyOrigin = "{proxy_origin_js}";
   const proxyPrefix = proxyOrigin + "/proxy/";
+  const upstreamContext = upstreamBase.toString();
+  const contextHeader = "x-webrascal-upstream";
   const skip = /^(data:|blob:|javascript:|about:|mailto:)/i;
   const b64url = (input) => {{
     const bytes = new TextEncoder().encode(input);
@@ -157,6 +159,7 @@ fn runtime_shim_script(upstream: &Url, proxy_origin: &Url) -> String {
   }};
   const origFetch = window.fetch;
   window.fetch = function(input, init) {{
+    let nextInit = init;
     try {{
       if (input instanceof Request) {{
         const proxied = toProxy(input.url);
@@ -165,13 +168,34 @@ fn runtime_shim_script(upstream: &Url, proxy_origin: &Url) -> String {
         const proxied = toProxy(input);
         if (proxied) input = proxied;
       }}
+      const req = input instanceof Request ? input : null;
+      const headers = new Headers((nextInit && nextInit.headers) || (req ? req.headers : undefined));
+      headers.set(contextHeader, upstreamContext);
+      nextInit = Object.assign({{}}, nextInit || {{}}, {{ headers }});
     }} catch (_) {{}}
-    return origFetch.call(this, input, init);
+    return origFetch.call(this, input, nextInit);
   }};
   const origOpen = XMLHttpRequest.prototype.open;
   XMLHttpRequest.prototype.open = function(method, url) {{
+    this.__wrHasContextHeader = false;
     const proxied = toProxy(url);
     return origOpen.call(this, method, proxied || url, ...Array.prototype.slice.call(arguments, 2));
+  }};
+  const origSetRequestHeader = XMLHttpRequest.prototype.setRequestHeader;
+  XMLHttpRequest.prototype.setRequestHeader = function(name, value) {{
+    if (String(name).toLowerCase() === contextHeader) {{
+      this.__wrHasContextHeader = true;
+    }}
+    return origSetRequestHeader.call(this, name, value);
+  }};
+  const origSend = XMLHttpRequest.prototype.send;
+  XMLHttpRequest.prototype.send = function(body) {{
+    try {{
+      if (!this.__wrHasContextHeader) {{
+        origSetRequestHeader.call(this, contextHeader, upstreamContext);
+      }}
+    }} catch (_) {{}}
+    return origSend.call(this, body);
   }};
   if (navigator.sendBeacon) {{
     const origBeacon = navigator.sendBeacon.bind(navigator);
