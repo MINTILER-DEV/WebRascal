@@ -21,7 +21,9 @@ self.addEventListener("fetch", (event) => {
 
   const token = base64Url(url.href);
   const proxied = `/proxy/${token}`;
-  event.respondWith(fetch(proxied));
+  event.respondWith(
+    fetch(proxied).catch(() => fetch(request))
+  );
 });
 
 function base64Url(input) {

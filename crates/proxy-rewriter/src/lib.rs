@@ -30,7 +30,7 @@ pub fn decode_target(token: &str) -> Result<Url, RewriteError> {
 
 pub fn rewrite_html(html: &str, upstream: &Url, proxy_origin: &Url) -> String {
     let attr_re = attr_regex();
-    attr_re
+    let rewritten = attr_re
         .replace_all(html, |caps: &regex::Captures<'_>| {
             let attr = caps.get(1).map(|m| m.as_str()).unwrap_or_default();
             let raw = caps.get(2).map(|m| m.as_str()).unwrap_or_default();
@@ -54,7 +54,8 @@ pub fn rewrite_html(html: &str, upstream: &Url, proxy_origin: &Url) -> String {
             let rewritten = proxy_url(proxy_origin, &joined);
             format!(r#"{attr}="{rewritten}""#)
         })
-        .to_string()
+        .to_string();
+    inject_runtime_shim(&rewritten, upstream, proxy_origin)
 }
 
 pub fn rewrite_location_header(headers: &mut HeaderMap, upstream: &Url, proxy_origin: &Url) {
@@ -106,6 +107,92 @@ fn attr_regex() -> &'static Regex {
     })
 }
 
+fn inject_runtime_shim(html: &str, upstream: &Url, proxy_origin: &Url) -> String {
+    let script = runtime_shim_script(upstream, proxy_origin);
+    if let Some(idx) = html.find("</head>") {
+        let mut out = String::with_capacity(html.len() + script.len() + 1);
+        out.push_str(&html[..idx]);
+        out.push_str(&script);
+        out.push_str(&html[idx..]);
+        return out;
+    }
+    let mut out = String::with_capacity(html.len() + script.len() + 1);
+    out.push_str(&script);
+    out.push_str(html);
+    out
+}
+
+fn runtime_shim_script(upstream: &Url, proxy_origin: &Url) -> String {
+    let upstream_js = js_string_escape(upstream.as_str());
+    let proxy_origin_js = js_string_escape(proxy_origin.as_str().trim_end_matches('/'));
+    format!(
+        r#"<script>
+(() => {{
+  const upstreamBase = new URL("{upstream_js}");
+  const proxyOrigin = "{proxy_origin_js}";
+  const proxyPrefix = proxyOrigin + "/proxy/";
+  const skip = /^(data:|blob:|javascript:|about:|mailto:)/i;
+  const b64url = (input) => {{
+    const bytes = new TextEncoder().encode(input);
+    let binary = "";
+    for (const b of bytes) binary += String.fromCharCode(b);
+    return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "");
+  }};
+  const toProxy = (input) => {{
+    try {{
+      const raw = typeof input === "string" ? input : (input && input.url) ? input.url : "";
+      if (!raw || skip.test(raw)) return null;
+      const resolved = new URL(raw, upstreamBase);
+      if (resolved.origin === proxyOrigin) {{
+        if (resolved.pathname.startsWith("/proxy/")) return resolved.toString();
+        const mapped = new URL(resolved.pathname + resolved.search + resolved.hash, upstreamBase.origin);
+        return proxyPrefix + b64url(mapped.toString());
+      }}
+      const abs = resolved.toString();
+      if (abs.startsWith(proxyPrefix)) return abs;
+      return proxyPrefix + b64url(abs);
+    }} catch (_) {{
+      return null;
+    }}
+  }};
+  const origFetch = window.fetch;
+  window.fetch = function(input, init) {{
+    try {{
+      if (input instanceof Request) {{
+        const proxied = toProxy(input.url);
+        if (proxied) input = new Request(proxied, input);
+      }} else {{
+        const proxied = toProxy(input);
+        if (proxied) input = proxied;
+      }}
+    }} catch (_) {{}}
+    return origFetch.call(this, input, init);
+  }};
+  const origOpen = XMLHttpRequest.prototype.open;
+  XMLHttpRequest.prototype.open = function(method, url) {{
+    const proxied = toProxy(url);
+    return origOpen.call(this, method, proxied || url, ...Array.prototype.slice.call(arguments, 2));
+  }};
+  if (navigator.sendBeacon) {{
+    const origBeacon = navigator.sendBeacon.bind(navigator);
+    navigator.sendBeacon = function(url, data) {{
+      const proxied = toProxy(url);
+      return origBeacon(proxied || url, data);
+    }};
+  }}
+}})();
+</script>"#
+    )
+}
+
+fn js_string_escape(input: &str) -> String {
+    input
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -128,5 +215,15 @@ mod tests {
 
         assert!(out.contains("http://127.0.0.1:8080/proxy/"));
         assert!(!out.contains("href=\"/next\""));
+    }
+
+    #[test]
+    fn html_rewrite_injects_runtime_shim() {
+        let upstream = Url::parse("https://example.com/").unwrap();
+        let proxy = Url::parse("http://127.0.0.1:8080").unwrap();
+        let input = r#"<html><head></head><body>ok</body></html>"#;
+        let out = rewrite_html(input, &upstream, &proxy);
+        assert!(out.contains("window.fetch = function"));
+        assert!(out.contains("</script></head>"));
     }
 }

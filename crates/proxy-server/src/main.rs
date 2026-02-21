@@ -66,6 +66,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/encode", get(encode))
         .route("/proxy/:token", any(proxy))
         .nest_service("/web", ServeDir::new("web"))
+        .route("/*path", any(proxy_relative))
         .with_state(Arc::new(state));
 
     info!("proxy server listening on {}", args.listen);
@@ -107,11 +108,41 @@ async fn proxy(
     let body_bytes = axum::body::to_bytes(request.into_body(), 16 * 1024 * 1024)
         .await
         .map_err(|e| ProxyError::Upstream(format!("failed reading request body: {e}")))?;
+    dispatch_upstream(&state, upstream, method, headers, body_bytes).await
+}
 
+async fn proxy_relative(
+    State(state): State<Arc<AppState>>,
+    request: Request<Body>,
+) -> Result<Response<Body>, ProxyError> {
+    let method = request.method().clone();
+    let uri = request.uri().clone();
+    let headers = request.headers().clone();
+    let upstream_context = upstream_from_context(&headers)
+        .ok_or_else(|| ProxyError::BadRequest("missing proxy context (referer/cookie)".to_string()))?;
+    let upstream = absolutize_relative_target(&upstream_context, &uri)
+        .map_err(|e| ProxyError::BadRequest(format!("invalid relative proxy target: {e}")))?;
+    let body_bytes = axum::body::to_bytes(request.into_body(), 16 * 1024 * 1024)
+        .await
+        .map_err(|e| ProxyError::Upstream(format!("failed reading request body: {e}")))?;
+    dispatch_upstream(&state, upstream, method, headers, body_bytes).await
+}
+
+async fn dispatch_upstream(
+    state: &AppState,
+    upstream: Url,
+    method: Method,
+    headers: HeaderMap,
+    body_bytes: axum::body::Bytes,
+) -> Result<Response<Body>, ProxyError> {
     let mut outgoing = state.client.request(method_from_axum(&method), upstream.clone());
-    outgoing = outgoing.headers(filtered_request_headers(&headers));
+    outgoing = outgoing.headers(filtered_request_headers(
+        &headers,
+        &upstream,
+        &state.public_origin,
+    ));
     if !body_bytes.is_empty() {
-        outgoing = outgoing.body(body_bytes.clone());
+        outgoing = outgoing.body(body_bytes);
     }
 
     let upstream_res = outgoing
@@ -126,6 +157,7 @@ async fn proxy(
     let status = upstream_res.status();
     let mut response_headers = filtered_response_headers(upstream_res.headers());
     rewrite_location_header(&mut response_headers, &upstream, &state.public_origin);
+    apply_proxy_context_headers(&mut response_headers, &upstream);
 
     let content_type = upstream_res
         .headers()
@@ -158,16 +190,84 @@ async fn proxy(
     Ok(response)
 }
 
+fn upstream_from_referer(headers: &HeaderMap) -> Option<Url> {
+    let referer = headers.get(header::REFERER)?.to_str().ok()?;
+    let referer_url = Url::parse(referer).ok()?;
+    let mut parts = referer_url.path().trim_start_matches('/').split('/');
+    let first = parts.next()?;
+    if first != "proxy" {
+        return None;
+    }
+    let token = parts.next()?;
+    decode_target(token).ok()
+}
+
+fn upstream_from_context(headers: &HeaderMap) -> Option<Url> {
+    if let Some(url) = upstream_from_referer(headers) {
+        return Some(url);
+    }
+
+    let cookie = headers.get(header::COOKIE)?.to_str().ok()?;
+    for part in cookie.split(';') {
+        let trimmed = part.trim();
+        if let Some(token) = trimmed.strip_prefix("wr_ctx=") {
+            if let Ok(url) = decode_target(token) {
+                return Some(url);
+            }
+        }
+    }
+    None
+}
+
+fn absolutize_relative_target(upstream_context: &Url, uri: &axum::http::Uri) -> Result<Url, url::ParseError> {
+    let mut origin = upstream_context.clone();
+    origin.set_path("/");
+    origin.set_query(None);
+    origin.set_fragment(None);
+    let path_q = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
+    origin.join(path_q)
+}
+
 fn method_from_axum(method: &Method) -> reqwest::Method {
     reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap_or(reqwest::Method::GET)
 }
 
-fn filtered_request_headers(input: &HeaderMap) -> reqwest::header::HeaderMap {
+fn filtered_request_headers(
+    input: &HeaderMap,
+    upstream: &Url,
+    proxy_origin: &Url,
+) -> reqwest::header::HeaderMap {
     let mut out = reqwest::header::HeaderMap::new();
     for (name, value) in input.iter() {
-        if is_hop_by_hop(name) || name == header::HOST || name == header::CONTENT_LENGTH {
+        if is_hop_by_hop(name)
+            || name == header::HOST
+            || name == header::CONTENT_LENGTH
+            || name.as_str().eq_ignore_ascii_case("x-webrascal-upstream")
+        {
             continue;
         }
+
+        if name == header::COOKIE {
+            if let Some(cookie) = sanitize_cookie_header(value) {
+                out.insert(reqwest::header::COOKIE, cookie);
+            }
+            continue;
+        }
+
+        if name == header::ORIGIN {
+            if let Ok(origin) = reqwest::header::HeaderValue::from_str(&upstream.origin().ascii_serialization()) {
+                out.insert(reqwest::header::ORIGIN, origin);
+            }
+            continue;
+        }
+
+        if name == header::REFERER {
+            if let Some(referrer) = rewrite_referer_for_upstream(value, upstream, proxy_origin) {
+                out.insert(reqwest::header::REFERER, referrer);
+            }
+            continue;
+        }
+
         if let (Ok(parsed_name), Ok(parsed_value)) = (
             reqwest::header::HeaderName::from_bytes(name.as_str().as_bytes()),
             reqwest::header::HeaderValue::from_bytes(value.as_bytes()),
@@ -178,20 +278,103 @@ fn filtered_request_headers(input: &HeaderMap) -> reqwest::header::HeaderMap {
     out
 }
 
+fn sanitize_cookie_header(value: &HeaderValue) -> Option<reqwest::header::HeaderValue> {
+    let raw = value.to_str().ok()?;
+    let mut kept = Vec::new();
+    for part in raw.split(';') {
+        let trimmed = part.trim();
+        if trimmed.is_empty() || trimmed.starts_with("wr_ctx=") {
+            continue;
+        }
+        kept.push(trimmed);
+    }
+    if kept.is_empty() {
+        return None;
+    }
+    reqwest::header::HeaderValue::from_str(&kept.join("; ")).ok()
+}
+
+fn rewrite_referer_for_upstream(
+    value: &HeaderValue,
+    upstream: &Url,
+    proxy_origin: &Url,
+) -> Option<reqwest::header::HeaderValue> {
+    let raw = value.to_str().ok()?;
+    let parsed = Url::parse(raw).ok();
+
+    let rewritten = if let Some(ref_url) = parsed {
+        if same_origin(&ref_url, proxy_origin) {
+            if let Some(token) = ref_url.path().strip_prefix("/proxy/") {
+                decode_target(token).ok().map(|u| u.to_string()).unwrap_or_else(|| raw.to_string())
+            } else {
+                let mut mapped = upstream.clone();
+                mapped.set_path(ref_url.path());
+                mapped.set_query(ref_url.query());
+                mapped.set_fragment(ref_url.fragment());
+                mapped.to_string()
+            }
+        } else {
+            raw.to_string()
+        }
+    } else {
+        raw.to_string()
+    };
+
+    reqwest::header::HeaderValue::from_str(&rewritten).ok()
+}
+
+fn same_origin(a: &Url, b: &Url) -> bool {
+    a.scheme() == b.scheme()
+        && a.host_str() == b.host_str()
+        && a.port_or_known_default() == b.port_or_known_default()
+}
+
 fn filtered_response_headers(input: &reqwest::header::HeaderMap) -> HeaderMap {
     let mut out = HeaderMap::new();
     for (name, value) in input.iter() {
-        if is_hop_by_hop(name) || name == reqwest::header::CONTENT_LENGTH {
+        if is_hop_by_hop(name) || name == reqwest::header::CONTENT_LENGTH || is_strict_security_response_header(name) {
             continue;
         }
         if let (Ok(parsed_name), Ok(parsed_value)) = (
             HeaderName::from_bytes(name.as_str().as_bytes()),
             HeaderValue::from_bytes(value.as_bytes()),
         ) {
-            out.insert(parsed_name, parsed_value);
+            if parsed_name == header::SET_COOKIE {
+                out.append(parsed_name, parsed_value);
+            } else {
+                out.insert(parsed_name, parsed_value);
+            }
         }
     }
     out
+}
+
+fn is_strict_security_response_header(name: &reqwest::header::HeaderName) -> bool {
+    matches!(
+        name.as_str().to_ascii_lowercase().as_str(),
+        "x-frame-options"
+            | "content-security-policy"
+            | "content-security-policy-report-only"
+            | "referrer-policy"
+            | "cross-origin-opener-policy"
+            | "cross-origin-embedder-policy"
+            | "cross-origin-resource-policy"
+    )
+}
+
+fn apply_proxy_context_headers(headers: &mut HeaderMap, upstream: &Url) {
+    let token = encode_target(upstream);
+    let cookie = format!("wr_ctx={token}; Path=/; HttpOnly; SameSite=Lax");
+    if let Ok(value) = HeaderValue::from_str(&cookie) {
+        headers.append(header::SET_COOKIE, value);
+    }
+
+    if !headers.contains_key(header::REFERRER_POLICY) {
+        headers.insert(
+            header::REFERRER_POLICY,
+            HeaderValue::from_static("strict-origin-when-cross-origin"),
+        );
+    }
 }
 
 fn is_hop_by_hop(name: &HeaderName) -> bool {
