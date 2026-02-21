@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>WebRascal Proxy Outline</title>
+  <style>
+    :root {
+      --bg: #f3f4ef;
+      --panel: #fffdf7;
+      --ink: #222222;
+      --muted: #5d5d5d;
+      --accent: #1f7a63;
+      --border: #d9d3c3;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+      color: var(--ink);
+      background: radial-gradient(circle at 15% 20%, #f9ebc8 0%, transparent 35%),
+                  radial-gradient(circle at 80% 25%, #d9f2e6 0%, transparent 30%),
+                  var(--bg);
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      padding: 1.5rem;
+    }
+    .frame {
+      width: min(960px, 100%);
+      border: 1px solid var(--border);
+      background: var(--panel);
+      border-radius: 14px;
+      box-shadow: 0 20px 40px rgba(0, 0, 0, 0.08);
+      overflow: hidden;
+    }
+    .toolbar {
+      display: flex;
+      gap: 0.5rem;
+      padding: 0.9rem;
+      border-bottom: 1px solid var(--border);
+      background: linear-gradient(90deg, #ffead8, #f6f6e3);
+    }
+    input {
+      flex: 1;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 0.75rem 0.85rem;
+      font-size: 0.95rem;
+      min-width: 0;
+    }
+    button {
+      border: 0;
+      border-radius: 10px;
+      background: var(--accent);
+      color: white;
+      padding: 0.75rem 1rem;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    main {
+      padding: 1rem;
+      display: grid;
+      gap: 0.75rem;
+    }
+    #status {
+      margin: 0;
+      color: var(--muted);
+      font-size: 0.95rem;
+    }
+    iframe {
+      width: 100%;
+      height: 65vh;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: white;
+    }
+  </style>
+</head>
+<body>
+  <section class="frame">
+    <form id="proxy-form" class="toolbar">
+      <input id="target-url" type="url" value="https://example.com" required />
+      <button type="submit">Browse</button>
+    </form>
+    <main>
+      <p id="status">Loading wasm runtime...</p>
+      <iframe id="proxy-view" title="proxied page"></iframe>
+    </main>
+  </section>
+  <script type="module" src="/bootstrap.js"></script>
+</body>
+</html>
+

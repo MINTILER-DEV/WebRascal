@@ -1,0 +1,18 @@
+[package]
+name = "proxy-server"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+http.workspace = true
+proxy-core = { path = "../proxy-core" }
+proxy-rewriter = { path = "../proxy-rewriter" }
+reqwest.workspace = true
+tokio.workspace = true
+tower-http = { version = "0.6", features = ["fs"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+

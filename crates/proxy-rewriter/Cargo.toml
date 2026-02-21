@@ -1,0 +1,12 @@
+[package]
+name = "proxy-rewriter"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+proxy-core = { path = "../proxy-core" }
+regex.workspace = true
+thiserror.workspace = true
+url.workspace = true
+
